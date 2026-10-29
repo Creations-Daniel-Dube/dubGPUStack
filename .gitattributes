@@ -1,0 +1,20 @@
+# Fins de ligne LF partout, Windows et Linux.
+* text=auto eol=lf
+
+*.rs     text eol=lf
+*.toml   text eol=lf
+*.json   text eol=lf
+*.md     text eol=lf
+*.lock   text eol=lf
+*.ftl    text eol=lf
+*.cmd    text eol=lf
+*.code-workspace text eol=lf
+
+*.png      binary
+*.ico      binary
+*.afphoto  binary
+*.afdesign binary
+*.tiff     binary
+*.tif      binary
+*.exe      binary
+*.zip      binary
