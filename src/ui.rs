@@ -18,8 +18,6 @@ use crate::gpu;
 use crate::icon::app_icon;
 use crate::settings::Settings;
 
-const VERSION: &str = env!("CARGO_PKG_VERSION");
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tab { Canvas, Frames, Result, Log }
 
@@ -77,7 +75,6 @@ pub struct App {
     tab: Tab,
     metric: Metric,
     linked: bool,
-    about: bool,
     confirm: bool,
     result_path: String,
     summary: String,
@@ -110,7 +107,6 @@ impl App {
             tab: Tab::Canvas,
             metric: Metric::Fwhm,
             linked: true,
-            about: false,
             confirm: false,
             result_path: String::new(),
             summary: String::new(),
@@ -603,9 +599,6 @@ impl App {
                 if ui.button("Empiler").clicked() { self.start(false, false); ui.close(); }
                 if ui.button("Quitter").clicked() { ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close); }
             });
-            ui.menu_button("Aide", |ui| {
-                if ui.button("À propos").clicked() { self.about = true; ui.close(); }
-            });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.label(RichText::new(&self.gpu_line).small());
             });
@@ -912,16 +905,6 @@ impl eframe::App for App {
             Tab::Result => self.result_tab(ui),
             Tab::Log => self.log_tab(ui),
         });
-        if self.about {
-            egui::Window::new("À propos de dubGPUStack").collapsible(false).show(ui.ctx(), |ui| {
-                ui.label(format!("dubGPUStack {VERSION}"));
-                ui.label("Empilement astronomique sur GPU NVIDIA.");
-                ui.label("Œuvre dérivée de GPU Stacker (Jason Prater) et des algorithmes de Siril 1.4.");
-                ui.label("Licence GNU GPL-3.0 ou ultérieure. Voir LICENSE et THIRD-PARTY-NOTICES.txt.");
-                ui.label("Seul le pilote NVIDIA est requis : nvcuda.dll.");
-                if ui.button("Fermer").clicked() { self.about = false; }
-            });
-        }
         if self.busy {
             ctx.request_repaint();
         } else {
