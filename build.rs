@@ -1,5 +1,8 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+
+/// Dernier nightly d'avant le relèvement du plancher NVPTX à `sm_70` (Rust 1.97, 29 avril 2026).
+const PASCAL_TOOLCHAIN: &str = "nightly-2026-04-28";
 
 fn main() {
     embed_windows_icon();
@@ -9,14 +12,24 @@ fn main() {
     rerun_tree(&kernel_root);
 
     let out_dir = Path::new(&std::env::var("OUT_DIR").unwrap()).to_path_buf();
-    let ptx_path = out_dir.join("kernels.ptx");
     let source = kernel_root.join("lib.rs");
-    let emit = format!("asm={}", ptx_path.display());
 
-    let status = Command::new("rustup")
+    let modern = compile_ptx(&out_dir.join("kernels.ptx"), &source, "nightly", "sm_70");
+    let pascal = compile_ptx(&out_dir.join("kernels-sm61.ptx"), &source, PASCAL_TOOLCHAIN, "sm_61");
+
+    println!("cargo:rustc-env=DUBGPUSTACK_PTX={}", modern.display());
+    println!("cargo:rustc-env=DUBGPUSTACK_PTX_STAMP={}", stamp_of(&modern));
+    println!("cargo:rustc-env=DUBGPUSTACK_PTX_SM61={}", pascal.display());
+    println!("cargo:rustc-env=DUBGPUSTACK_PTX_SM61_STAMP={}", stamp_of(&pascal));
+}
+
+fn compile_ptx(dest: &Path, source: &Path, toolchain: &str, cpu: &str) -> PathBuf {
+    let emit = format!("asm={}", dest.display());
+    let cpu_flag = format!("target-cpu={cpu}");
+    let output = Command::new("rustup")
         .args([
             "run",
-            "nightly",
+            toolchain,
             "rustc",
             "--edition",
             "2024",
@@ -34,24 +47,41 @@ fn main() {
             "overflow-checks=off",
             "-C",
             "debug-assertions=off",
+            "-C",
+            &cpu_flag,
             "--emit",
             &emit,
         ])
-        .arg(&source)
-        .status()
-        .expect("rustup nightly est requis pour compiler les noyaux GPU");
+        .arg(source)
+        .output()
+        .unwrap_or_else(|err| panic!("impossible de lancer rustup {toolchain} : {err}"));
 
-    if !status.success() {
-        panic!("la compilation PTX des noyaux a échoué");
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        panic!(
+            "la compilation PTX {cpu} ({toolchain}) a échoué.\n{stderr}\n\
+             Le module Pascal exige :\n  \
+             rustup toolchain install {PASCAL_TOOLCHAIN} --profile minimal\n  \
+             rustup target add nvptx64-nvidia-cuda --toolchain {PASCAL_TOOLCHAIN}"
+        );
     }
 
-    let ptx = std::fs::read_to_string(&ptx_path).expect("lecture du PTX");
+    let ptx = std::fs::read_to_string(dest).unwrap_or_else(|err| panic!("lecture du PTX {cpu} : {err}"));
+    let marker = format!(".target {cpu}");
+    if !ptx.lines().any(|line| line.trim() == marker) {
+        panic!("le PTX {cpu} ne contient pas `{marker}`");
+    }
     let ptx = stub_extern_funcs(&ptx);
-    std::fs::write(&ptx_path, &ptx).expect("écriture du PTX");
-    let stamp = ptx.bytes().fold(0u64, |acc, byte| acc.wrapping_mul(16777619).wrapping_add(byte as u64));
-    println!("cargo:rerun-if-changed={}", ptx_path.display());
-    println!("cargo:rustc-env=DUBGPUSTACK_PTX={}", ptx_path.display());
-    println!("cargo:rustc-env=DUBGPUSTACK_PTX_STAMP={stamp}");
+    std::fs::write(dest, &ptx).unwrap_or_else(|err| panic!("écriture du PTX {cpu} : {err}"));
+    println!("cargo:rerun-if-changed={}", dest.display());
+    dest.to_path_buf()
+}
+
+fn stamp_of(path: &Path) -> u64 {
+    std::fs::read(path)
+        .unwrap_or_default()
+        .into_iter()
+        .fold(0u64, |acc, byte| acc.wrapping_mul(16777619).wrapping_add(byte as u64))
 }
 
 /// Le JIT du pilote refuse un module qui appelle `panic_bounds_check` sans la définir.
@@ -65,16 +95,30 @@ fn stub_extern_funcs(ptx: &str) -> String {
             out.push('\n');
             let mut closed = false;
             for next in lines.by_ref() {
-                if next.trim() == ".noreturn;" {
-                    out.push_str(".noreturn\n{\n\ttrap;\n\texit;\n}\n");
-                    closed = true;
-                    break;
+                match next.trim() {
+                    ".noreturn;" => {
+                        out.push_str(".noreturn\n{\n\ttrap;\n\texit;\n}\n");
+                        closed = true;
+                        break;
+                    }
+                    ";" => {
+                        out.push_str("{\n\ttrap;\n\texit;\n}\n");
+                        closed = true;
+                        break;
+                    }
+                    ");" => {
+                        out.push_str(")\n{\n\ttrap;\n\texit;\n}\n");
+                        closed = true;
+                        break;
+                    }
+                    _ => {
+                        out.push_str(next);
+                        out.push('\n');
+                    }
                 }
-                out.push_str(next);
-                out.push('\n');
             }
             if !closed {
-                panic!("PTX : fonction externe sans terminateur .noreturn;");
+                panic!("PTX : fonction externe sans terminateur");
             }
         } else {
             out.push_str(line);

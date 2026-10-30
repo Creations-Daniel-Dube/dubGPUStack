@@ -143,7 +143,7 @@ pub fn run(cfg: &JobConfig, cancel: &AtomicBool, mut emit: impl FnMut(Event)) ->
     emit(Event::Progress { phase: "Démarrage".into(), done: 0.0, total: 1.0, detail: "GPU".into() });
     let gpu = Gpu::new().map_err(|err| format!("GPU indisponible : {err}"))?;
     let info = gpu.info()?;
-    emit(Event::Log { level: "info".into(), message: format!("GPU {} · {:.1} Gio", info.name, info.total as f64 / 1024.0 / 1024.0 / 1024.0) });
+    emit(Event::Log { level: "info".into(), message: info.summary() });
     let limit = if cfg.gpu_mem_gib > 0.0 { (cfg.gpu_mem_gib * 1024.0 * 1024.0 * 1024.0) as usize } else { (info.total as f64 * 0.75) as usize };
     let mut output = if cfg.lights_dir.is_empty() {
         run_sequence(cfg, &gpu, limit, cancel, &mut emit)?

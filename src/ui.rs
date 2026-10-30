@@ -122,7 +122,7 @@ impl App {
             open_at_start: open,
         };
         match gpu::probe_gpu() {
-            Ok(info) => app.gpu_line = format!("{} · {:.1} Gio", info.name, info.total as f64 / 1024.0 / 1024.0 / 1024.0),
+            Ok(info) => app.gpu_line = info.summary(),
             Err(err) => {
                 app.gpu_line = "aucun GPU NVIDIA".to_string();
                 app.push("warn", &format!("GPU indisponible : {err}"));

@@ -35,14 +35,49 @@ pub struct GpuInfo {
     pub name: String,
     pub total: usize,
     pub free: usize,
+    pub major: i32,
+    pub minor: i32,
+}
+
+impl GpuInfo {
+    pub fn summary(&self) -> String {
+        let arch = kernel_arch(self.major, self.minor).unwrap_or("non supporté");
+        format!("{} · compute {}.{} · {arch} · {:.1} Gio", self.name, self.major, self.minor, self.total as f64 / 1024.0 / 1024.0 / 1024.0)
+    }
+}
+
+/// `sm_61` à partir de la GTX 1060, `sm_70` à partir de la RTX 2060 (compute 7.0).
+pub fn kernel_arch(major: i32, minor: i32) -> Option<&'static str> {
+    if (major, minor) >= (7, 0) {
+        Some("sm_70")
+    } else if (major, minor) >= (6, 1) {
+        Some("sm_61")
+    } else {
+        None
+    }
+}
+
+fn ptx_source(major: i32, minor: i32) -> Result<&'static str, String> {
+    match kernel_arch(major, minor) {
+        Some("sm_70") => Ok(include_str!(env!("DUBGPUSTACK_PTX"))),
+        Some("sm_61") => Ok(include_str!(env!("DUBGPUSTACK_PTX_SM61"))),
+        _ => Err(format!(
+            "cette carte est en compute {major}.{minor}. dubGPUStack prend en charge la GTX 1060 (6.1) et les cartes plus récentes"
+        )),
+    }
 }
 
 pub fn probe_gpu() -> Result<GpuInfo, String> {
     let ctx = CudaContext::new(0).map_err(|err| err.to_string())?;
+    device_info(&ctx)
+}
+
+fn device_info(ctx: &CudaContext) -> Result<GpuInfo, String> {
     let name = ctx.name().map_err(|err| err.to_string())?;
     let total = ctx.total_mem().map_err(|err| err.to_string())?;
-    let free = ctx.default_stream().context().mem_get_info().map(|(free, _)| free).map_err(|err| err.to_string())?;
-    Ok(GpuInfo { name, total, free })
+    let (free, _) = ctx.mem_get_info().map_err(|err| err.to_string())?;
+    let (major, minor) = ctx.compute_capability().map_err(|err| err.to_string())?;
+    Ok(GpuInfo { name, total, free, major, minor })
 }
 
 pub struct Gpu {
@@ -58,10 +93,15 @@ pub struct Gpu {
 impl Gpu {
     pub fn new() -> Result<Self, String> {
         let ctx = CudaContext::new(0).map_err(|err| err.to_string())?;
-        let stream = ctx.default_stream();
-        let ptx = Ptx::from_src(include_str!(env!("DUBGPUSTACK_PTX")));
+        let (major, minor) = ctx.compute_capability().map_err(|err| err.to_string())?;
         let _stamp = env!("DUBGPUSTACK_PTX_STAMP");
-        let module = ctx.load_module(ptx).map_err(|err| err.to_string())?;
+        let _stamp_pascal = env!("DUBGPUSTACK_PTX_SM61_STAMP");
+        Self::from_context(ctx, ptx_source(major, minor)?)
+    }
+
+    fn from_context(ctx: Arc<CudaContext>, ptx_src: &str) -> Result<Self, String> {
+        let stream = ctx.default_stream();
+        let module = ctx.load_module(Ptx::from_src(ptx_src)).map_err(|err| err.to_string())?;
         let load = |name: &str| module.load_function(name).map_err(|err| format!("{name}: {err}"));
         let ramp = stream.clone_htod(&ramp_table()).map_err(|err| err.to_string())?;
         Ok(Self {
@@ -76,9 +116,7 @@ impl Gpu {
     }
 
     pub fn info(&self) -> Result<GpuInfo, String> {
-        let name = self.stream.context().name().map_err(|err| err.to_string())?;
-        let (free, total) = self.stream.context().mem_get_info().map_err(|err| err.to_string())?;
-        Ok(GpuInfo { name, total, free })
+        device_info(self.stream.context())
     }
 
     pub fn zeros(&self, len: usize) -> Result<CudaSlice<f32>, String> {
@@ -273,12 +311,25 @@ pub struct RejectSums {
 
 #[cfg(test)]
 mod tests {
-    use super::Gpu;
+    use super::{kernel_arch, Gpu};
+
+    #[test]
+    fn kernel_arch_splits_pascal_and_turing() {
+        assert_eq!(kernel_arch(6, 0), None);
+        assert_eq!(kernel_arch(6, 1), Some("sm_61"));
+        assert_eq!(kernel_arch(6, 2), Some("sm_61"));
+        assert_eq!(kernel_arch(7, 0), Some("sm_70"));
+        assert_eq!(kernel_arch(7, 5), Some("sm_70"));
+        assert_eq!(kernel_arch(8, 6), Some("sm_70"));
+    }
 
     #[test]
     fn embedded_ptx_has_no_unresolved_extern() {
-        let ptx = include_str!(env!("DUBGPUSTACK_PTX"));
-        assert!(!ptx.contains(".extern .func"), "{ptx}");
+        for ptx in [include_str!(env!("DUBGPUSTACK_PTX")), include_str!(env!("DUBGPUSTACK_PTX_SM61"))] {
+            assert!(!ptx.contains(".extern .func"), "{ptx}");
+        }
+        assert!(include_str!(env!("DUBGPUSTACK_PTX")).contains(".target sm_70"));
+        assert!(include_str!(env!("DUBGPUSTACK_PTX_SM61")).contains(".target sm_61"));
     }
 
     #[test]
@@ -286,11 +337,27 @@ mod tests {
         let gpu = Gpu::new().expect("le pilote doit accepter le PTX");
         let info = gpu.info().expect("info GPU");
         assert!(!info.name.is_empty());
+        assert!(info.major > 0);
+    }
+
+    #[test]
+    fn pascal_module_launches_on_newer_gpu() {
+        let ctx = cudarc::driver::CudaContext::new(0).expect("contexte");
+        let (major, minor) = ctx.compute_capability().expect("compute");
+        if (major, minor) < (6, 1) {
+            return;
+        }
+        let gpu = Gpu::from_context(ctx, include_str!(env!("DUBGPUSTACK_PTX_SM61"))).expect("le pilote doit accepter le PTX sm_61");
+        launch_sample(&gpu);
     }
 
     #[test]
     fn heavy_kernels_launch() {
         let gpu = Gpu::new().expect("gpu");
+        launch_sample(&gpu);
+    }
+
+    fn launch_sample(gpu: &Gpu) {
         let image = vec![0.4f32; 64 * 48];
         let mut num = gpu.zeros(64 * 48).expect("num");
         let mut den = gpu.zeros(64 * 48).expect("den");

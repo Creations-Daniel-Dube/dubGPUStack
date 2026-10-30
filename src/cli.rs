@@ -27,7 +27,8 @@ pub fn dispatch(args: &[String]) -> Option<i32> {
 fn probe() -> i32 {
     match gpu::probe_gpu() {
         Ok(info) => {
-            println(&format!("{{\"ev\":\"probe\",\"name\":\"{}\",\"total\":{},\"free\":{}}}", info.name.replace('"', "'"), info.total, info.free));
+            let kernels = gpu::kernel_arch(info.major, info.minor).unwrap_or("unsupported");
+            println(&format!("{{\"ev\":\"probe\",\"name\":\"{}\",\"total\":{},\"free\":{},\"major\":{},\"minor\":{},\"kernels\":\"{kernels}\"}}", info.name.replace('"', "'"), info.total, info.free, info.major, info.minor));
             0
         }
         Err(err) => {
