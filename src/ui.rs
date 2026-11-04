@@ -120,7 +120,7 @@ impl App {
             crop_y: 0,
             crop_w: 0,
             crop_h: 0,
-            advanced_open: true,
+            advanced_open: false,
             open_at_start: open,
         };
         match gpu::probe_gpu() {
@@ -701,18 +701,17 @@ impl App {
     }
 
     fn action_bar(&mut self, ui: &mut egui::Ui) {
-        let analyze = if self.busy && self.job == JobKind::Analyze { "Analyse…" } else { "Analyser" };
-        let test = if self.busy && self.job == JobKind::Test { "Test…" } else { "Bande test" };
-        let stack = if self.busy && self.job == JobKind::Stack { "Empilement…" } else { "Empiler" };
-        ui.horizontal(|ui| {
-            if ui.add_enabled(!self.busy, egui::Button::new(analyze)).on_hover_text("Détecte les étoiles et aligne les images, sans écrire de FITS.").clicked() {
-                self.start(true, false);
-            }
-            if ui.add_enabled(!self.busy, egui::Button::new(test)).on_hover_text("Empile une bande de 192 lignes au plus couvert, sans écrire de fichier.").clicked() {
-                self.start(false, true);
-            }
-        });
-        if ui.add_enabled(!self.busy, egui::Button::new(stack)).on_hover_text("Empile les images sélectionnées et écrit le FITS.").clicked() {
+        let analyze = if self.busy && self.job == JobKind::Analyze { "Analyse…" } else { "Analyser les images" };
+        let test = if self.busy && self.job == JobKind::Test { "Test…" } else { "Empiler une Bande test" };
+        let stack = if self.busy && self.job == JobKind::Stack { "Empilement…" } else { "Empiler les images retenues" };
+        let wide = egui::vec2(ui.available_width(), 36.0);
+        if ui.add_enabled(!self.busy, egui::Button::new(RichText::new(analyze).size(16.0)).min_size(wide)).on_hover_text("Détecte les étoiles et aligne les images, sans écrire de FITS.").clicked() {
+            self.start(true, false);
+        }
+        if ui.add_enabled(!self.busy, egui::Button::new(RichText::new(test).size(16.0)).min_size(wide)).on_hover_text("Empile une bande de 192 lignes au plus couvert, sans écrire de fichier.").clicked() {
+            self.start(false, true);
+        }
+        if ui.add_enabled(!self.busy, egui::Button::new(RichText::new(stack).size(16.0)).min_size(wide)).on_hover_text("Empile les images sélectionnées et écrit le FITS.").clicked() {
             self.start(false, false);
         }
         if self.busy {
@@ -1002,7 +1001,7 @@ impl App {
 
 pub fn run(open: Option<String>) -> eframe::Result {
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([1280.0, 820.0]).with_min_inner_size([980.0, 640.0]).with_title("dubGPUStack").with_icon(app_icon()),
+        viewport: egui::ViewportBuilder::default().with_inner_size([1600.0, 1080.0]).with_min_inner_size([980.0, 640.0]).with_title(format!("dubGPUStack v{}", job::VERSION)).with_icon(app_icon()),
         centered: true,
         ..Default::default()
     };
@@ -1044,7 +1043,7 @@ fn advanced_toggle(ui: &mut egui::Ui, open: &mut bool) {
     let help = "Affiche ou cache Empilement et Carte Vidéo / GPU.";
     let clicked = ui.horizontal(|ui| {
         let title = ui.add(egui::Label::new(RichText::new("Fonctions avancées").strong()).sense(egui::Sense::click())).on_hover_text(help);
-        let icon = if *open { "▼" } else { "▲" };
+        let icon = if *open { "▲" } else { "▼" };
         let mark = ui.add(egui::Label::new(RichText::new(icon).color(Color32::from_rgb(0xff, 0xe1, 0x4d)).strong()).sense(egui::Sense::click())).on_hover_text(help);
         title.clicked() || mark.clicked()
     }).inner;
