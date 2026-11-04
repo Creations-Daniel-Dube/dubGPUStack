@@ -9,6 +9,7 @@ use std::time::Instant;
 use serde::{Deserialize, Serialize};
 
 use super::cache::{self, Analysis, FrameStatsLite, Measures, RegistrationCache, SeqStatsCache};
+use super::export;
 use super::fits::{self, FitsValue};
 use super::lights::{self, Light};
 use super::masks;
@@ -17,6 +18,7 @@ use super::sequence::{self, Frame};
 use super::stack::{self, SampleFrame, SampleSource, StackParams};
 use super::stars::{self, FrameMetrics, StarList};
 use super::stats::{self, FrameStats};
+use super::stretch;
 use crate::gpu::Gpu;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -137,6 +139,8 @@ pub struct RunOutput {
     pub preview: Vec<f32>,
     pub preview_w: usize,
     pub preview_h: usize,
+    /// Aperçu déjà passé par AutoStretchHypermetric : ne pas réappliquer le STF.
+    pub display_ready: bool,
 }
 
 pub fn run(cfg: &JobConfig, cancel: &AtomicBool, mut emit: impl FnMut(Event)) -> Result<RunOutput, String> {
@@ -226,7 +230,7 @@ fn run_sequence(cfg: &JobConfig, gpu: &Gpu, budget: usize, free: usize, total: u
     frames.retain(|frame| stats_map.get(&frame.filenum).map(|st| st.bad.is_empty()).unwrap_or(false));
     if cfg.analyze_only {
         emit(Event::Log { level: "ok".into(), message: format!("{} images mesurées", frames.len()) });
-        return Ok(RunOutput { path: String::new(), frames: frames.len(), low: 0.0, high: 0.0, width: seq.frames.first().map(|frame| frame.width).unwrap_or(0), height: seq.frames.first().map(|frame| frame.height).unwrap_or(0), channels: seq.layers, elapsed: 0.0, preview: Vec::new(), preview_w: 0, preview_h: 0 });
+        return Ok(RunOutput { path: String::new(), frames: frames.len(), low: 0.0, high: 0.0, width: seq.frames.first().map(|frame| frame.width).unwrap_or(0), height: seq.frames.first().map(|frame| frame.height).unwrap_or(0), channels: seq.layers, elapsed: 0.0, preview: Vec::new(), preview_w: 0, preview_h: 0, display_ready: false });
     }
     if frames.len() < 2 {
         return Err("moins de deux images utilisables".to_string());
@@ -343,7 +347,7 @@ fn run_lights(cfg: &JobConfig, gpu: &Gpu, budget: usize, free: usize, total: usi
     }
     if cfg.analyze_only {
         emit(Event::Log { level: "ok".into(), message: format!("{} images alignées sur {ref_name}", lights.len()) });
-        return Ok(RunOutput { path: String::new(), frames: lights.len(), low: 0.0, high: 0.0, width, height, channels: if bayer.is_empty() { channels } else { 3 }, elapsed: 0.0, preview: Vec::new(), preview_w: 0, preview_h: 0 });
+        return Ok(RunOutput { path: String::new(), frames: lights.len(), low: 0.0, high: 0.0, width, height, channels: if bayer.is_empty() { channels } else { 3 }, elapsed: 0.0, preview: Vec::new(), preview_w: 0, preview_h: 0, display_ready: false });
     }
     let mut transforms = HashMap::new();
     for light in &lights {
@@ -539,7 +543,7 @@ fn finish_stack(cfg: &JobConfig, gpu: &Gpu, budget: usize, free: usize, total: u
     let (preview, preview_h, preview_w) = stack::bin_preview(&data, stacked.channels, stacked.height, stacked.width, factor);
     if cfg.rows.is_some() && cfg.output_path.is_empty() {
         emit(Event::Log { level: "ok".into(), message: format!("bande d'essai en {elapsed:.1} s") });
-        return Ok(RunOutput { path: String::new(), frames: samples.len(), low: stacked.rejected_low, high: stacked.rejected_high, width: stacked.width, height: stacked.height, channels: stacked.channels, elapsed, preview, preview_w, preview_h });
+        return Ok(RunOutput { path: String::new(), frames: samples.len(), low: stacked.rejected_low, high: stacked.rejected_high, width: stacked.width, height: stacked.height, channels: stacked.channels, elapsed, preview, preview_w, preview_h, display_ready: false });
     }
     let out = if cfg.output_path.is_empty() {
         let folder = reference.parent().unwrap_or(Path::new("."));
@@ -555,9 +559,41 @@ fn finish_stack(cfg: &JobConfig, gpu: &Gpu, budget: usize, free: usize, total: u
         let cov_path = out.with_file_name(format!("{}_coverage.fit", out.file_stem().and_then(|s| s.to_str()).unwrap_or("stack")));
         fits::write_fits(&cov_path, &cov, 1, stacked.height, stacked.width, &[])?;
     }
+    emit(Event::Progress { phase: "Stretch HyperMetric".into(), done: 0.0, total: 1.0, detail: out.display().to_string() });
+    let stretched = stretch::auto_stretch_hypermetric(&data, stacked.channels, stacked.height, stacked.width);
+    drop(data);
+    let (stretched_fit, png8, png16, tiff) = stretched_paths(&out);
+    fits::write_fits(&stretched_fit, &stretched.image, stacked.channels, stacked.height, stacked.width, &cards)?;
+    export::write_png(&png8, &stretched.image, stacked.channels, stacked.height, stacked.width, false)?;
+    export::write_png(&png16, &stretched.image, stacked.channels, stacked.height, stacked.width, true)?;
+    export::write_tiff32(&tiff, &stretched.image, stacked.channels, stacked.height, stacked.width)?;
+    let (preview, preview_h, preview_w) = stack::bin_preview(&stretched.image, stacked.channels, stacked.height, stacked.width, factor);
+    emit(Event::Progress { phase: "Stretch HyperMetric".into(), done: 1.0, total: 1.0, detail: format!("Log D {:.2}", stretched.log_d) });
     emit(Event::Log { level: "ok".into(), message: format!("terminé en {elapsed:.1} s · {}", out.display()) });
+    emit(Event::Log {
+        level: "ok".into(),
+        message: format!(
+            "HyperMetric Log D = {:.2} · {} · {} · {} · {}",
+            stretched.log_d,
+            stretched_fit.display(),
+            png8.display(),
+            png16.display(),
+            tiff.display()
+        ),
+    });
     let _ = total_rows;
-    Ok(RunOutput { path: out.display().to_string(), frames: samples.len(), low: stacked.rejected_low, high: stacked.rejected_high, width: stacked.width, height: stacked.height, channels: stacked.channels, elapsed, preview, preview_w, preview_h })
+    Ok(RunOutput { path: out.display().to_string(), frames: samples.len(), low: stacked.rejected_low, high: stacked.rejected_high, width: stacked.width, height: stacked.height, channels: stacked.channels, elapsed, preview, preview_w, preview_h, display_ready: true })
+}
+
+fn stretched_paths(master: &Path) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
+    let stem = master.file_stem().and_then(|s| s.to_str()).unwrap_or("stack");
+    let dir = master.parent().filter(|dir| !dir.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
+    (
+        dir.join(format!("{stem}_stretched.fit")),
+        dir.join(format!("{stem}_stretched.png")),
+        dir.join(format!("{stem}_stretched_16.png")),
+        dir.join(format!("{stem}_stretched.tiff")),
+    )
 }
 
 fn coefficients(cfg: &JobConfig, frames: &[Frame], reference: &Frame, layers: usize, reg_layer: Option<usize>, stats_map: &HashMap<i64, FrameStats>, all: &[Frame]) -> Result<(Vec<[f64; 3]>, Vec<[f64; 3]>, Vec<[f64; 3]>), String> {

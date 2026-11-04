@@ -211,8 +211,12 @@ impl App {
         let summary = self.summary.clone();
         self.push("ok", &summary);
         if !output.preview.is_empty() {
-            let params = stretch::auto_stf(&output.preview, output.channels, output.preview_h, output.preview_w, self.linked);
-            let rgba = stretch::apply_stf(&output.preview, output.channels, output.preview_h, output.preview_w, &params);
+            let rgba = if output.display_ready {
+                stretch::unit_rgba(&output.preview, output.channels, output.preview_h, output.preview_w)
+            } else {
+                let params = stretch::auto_stf(&output.preview, output.channels, output.preview_h, output.preview_w, self.linked);
+                stretch::apply_stf(&output.preview, output.channels, output.preview_h, output.preview_w, &params)
+            };
             let image = egui::ColorImage::from_rgba_unmultiplied([output.preview_w, output.preview_h], &rgba);
             self.preview = Some(ctx.load_texture("apercu", image, egui::TextureOptions::LINEAR));
         }

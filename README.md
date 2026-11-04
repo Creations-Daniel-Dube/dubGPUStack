@@ -1,9 +1,15 @@
 # dubGPUStack
 
-dubGPUStack empile des images astronomiques sur une carte NVIDIA. On lui donne un dossier de brutes ou une séquence Siril (`.seq`). Il détecte les étoiles, aligne les images, applique un drizzle Bayer, puis combine les poses : rejet, normalisation et fondu, selon la mathématique de Siril 1.4. Le résultat est un fichier FITS.
+**Version 0.4.1010**
 
-L'interface est en français, dans le thème de dubDSR et dubFocus. C'est un seul exécutable Windows. Le pilote NVIDIA déjà installé suffit : pas de Python, pas de CUDA Toolkit, pas de redistribuable à installer. La fenêtre s'ouvre aussi sans carte ; l'empilement indique alors que le GPU est indisponible.
+## Français
 
-On le lance sans argument, ou en lui passant le dossier ou le `.seq`. En ligne de commande, `probe` donne le nom de la carte et `stack` lance l'empilement.
+dubGPUStack assemble plusieurs photos du ciel en une seule image.
 
-dubGPUStack reprend GPU Stacker (Jason Prater, GPL-3) : les mêmes algorithmes, réécrits en Rust dans un seul programme. Licence GNU GPL-3.0 ou ultérieure. Voir `LICENSE` et `THIRD-PARTY-NOTICES.txt`.
+Vous lui donnez les clichés d’une même cible. Il les aligne, les superpose pour faire ressortir ce qui est faible, puis éclaircit le résultat pour que la nébuleuse, la galaxie ou les étoiles se voient bien. Il enregistre l’image combinée et une version prête à regarder.
+
+## English
+
+dubGPUStack turns several sky photos into one picture.
+
+You give it the shots of the same target. It lines them up, stacks them so the faint parts come forward, then brightens the result so the nebula, galaxy, or stars are easy to see. It saves the combined image and a version ready to look at.

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 pub mod cache;
+pub mod export;
 pub mod fits;
 pub mod job;
 pub mod lights;
