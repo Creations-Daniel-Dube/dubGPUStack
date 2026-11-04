@@ -95,8 +95,9 @@ fn stack_config(args: &[String]) -> Result<JobConfig, i32> {
             "--pixfrac" => { cfg.pixfrac = take(args, &mut index)?.parse().unwrap_or(0.0); Ok(()) }
             "--transform" => { cfg.transform = take(args, &mut index)?.to_string(); Ok(()) }
             "--analyze-only" => { cfg.analyze_only = true; Ok(()) }
-            "--strip" => { cfg.strip = take(args, &mut index)?.parse().unwrap_or(64); Ok(()) }
-            "--tile" => { cfg.tile = take(args, &mut index)?.parse().unwrap_or(1024); Ok(()) }
+            "--strip" => { cfg.strip = take(args, &mut index)?.parse().unwrap_or(0); Ok(()) }
+            "--tile" => { cfg.tile = take(args, &mut index)?.parse().unwrap_or(0); Ok(()) }
+            "--workers" => { cfg.workers = take(args, &mut index)?.parse().unwrap_or(6); Ok(()) }
             "--help" | "-h" => { print_help(); return Err(0); }
             other if other.starts_with('-') => {
                 println(&format!("option inconnue : {other}"));
@@ -167,7 +168,8 @@ fn print_help() {
     println("  [--sigma BAS HAUT] [--weight none|noise|wfwhm|nbstars] [--feather PIXELS]");
     println("  [--no-norm] [--no-rgb-equal] [--no-output-norm] [--rows Y0 Y1] [--crop X Y W H]");
     println("  [--overwrite] [--gpu-mem-gib N] [--scale 1|1.5|2|3] [--pixfrac 0.05..1]");
-    println("  [--transform affine|similarity] [--analyze-only]");
+    println("  [--transform affine|similarity] [--strip N] [--tile N] [--workers N] [--analyze-only]");
+    println("  strip et tile à 0 choisissent la bande selon la mémoire libre");
     println("Sans argument, ou avec un chemin, l'interface s'ouvre.");
 }
 

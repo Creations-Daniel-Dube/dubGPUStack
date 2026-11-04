@@ -44,6 +44,7 @@ pub struct JobConfig {
     pub gpu_mem_gib: f64,
     pub strip: i32,
     pub tile: i32,
+    pub workers: i32,
     pub overwrite: bool,
     pub drizzle_scale: f64,
     pub pixfrac: f64,
@@ -72,8 +73,9 @@ impl Default for JobConfig {
             rows: None,
             save_coverage: false,
             gpu_mem_gib: 0.0,
-            strip: 64,
-            tile: 1024,
+            strip: 0,
+            tile: 0,
+            workers: 6,
             overwrite: false,
             drizzle_scale: 1.0,
             pixfrac: 1.0,
@@ -144,17 +146,17 @@ pub fn run(cfg: &JobConfig, cancel: &AtomicBool, mut emit: impl FnMut(Event)) ->
     let gpu = Gpu::new().map_err(|err| format!("GPU indisponible : {err}"))?;
     let info = gpu.info()?;
     emit(Event::Log { level: "info".into(), message: info.summary() });
-    let limit = if cfg.gpu_mem_gib > 0.0 { (cfg.gpu_mem_gib * 1024.0 * 1024.0 * 1024.0) as usize } else { (info.total as f64 * 0.75) as usize };
+    let budget = stack::memory_budget(cfg.gpu_mem_gib, info.free, info.total);
     let mut output = if cfg.lights_dir.is_empty() {
-        run_sequence(cfg, &gpu, limit, cancel, &mut emit)?
+        run_sequence(cfg, &gpu, budget, info.free, info.total, cancel, &mut emit)?
     } else {
-        run_lights(cfg, &gpu, limit, cancel, &mut emit)?
+        run_lights(cfg, &gpu, budget, info.free, info.total, cancel, &mut emit)?
     };
     output.elapsed = started.elapsed().as_secs_f64();
     Ok(output)
 }
 
-fn run_sequence(cfg: &JobConfig, gpu: &Gpu, limit: usize, cancel: &AtomicBool, emit: &mut impl FnMut(Event)) -> Result<RunOutput, String> {
+fn run_sequence(cfg: &JobConfig, gpu: &Gpu, budget: usize, free: usize, total: usize, cancel: &AtomicBool, emit: &mut impl FnMut(Event)) -> Result<RunOutput, String> {
     let seq = sequence::parse_seq(Path::new(&cfg.seq_path))?;
     let problems = sequence::check_stackable(&seq);
     if !problems.is_empty() {
@@ -262,10 +264,10 @@ fn run_sequence(cfg: &JobConfig, gpu: &Gpu, limit: usize, cancel: &AtomicBool, e
             source: SampleSource::Shift { path: seq.frame_path(frame), weight: if use_drizzle { Some(seq.drizzle_path(frame)) } else { None } },
         });
     }
-    finish_stack(cfg, gpu, limit, cancel, emit, samples, seq.layers, (x0, y0, x1, y1), &seq.frame_path(&ref_frame), &frames.iter().map(|frame| sequence::read_frame_meta(&seq.frame_path(frame))).collect::<Vec<_>>())
+    finish_stack(cfg, gpu, budget, free, total, cancel, emit, samples, seq.layers, (x0, y0, x1, y1), &seq.frame_path(&ref_frame), &frames.iter().map(|frame| sequence::read_frame_meta(&seq.frame_path(frame))).collect::<Vec<_>>())
 }
 
-fn run_lights(cfg: &JobConfig, gpu: &Gpu, limit: usize, cancel: &AtomicBool, emit: &mut impl FnMut(Event)) -> Result<RunOutput, String> {
+fn run_lights(cfg: &JobConfig, gpu: &Gpu, budget: usize, free: usize, total: usize, cancel: &AtomicBool, emit: &mut impl FnMut(Event)) -> Result<RunOutput, String> {
     let folder = lights::find_lights_dir(Path::new(&cfg.lights_dir));
     let mut lights = lights::scan_lights(&folder);
     if let Some(names) = &cfg.include_files {
@@ -480,14 +482,33 @@ fn run_lights(cfg: &JobConfig, gpu: &Gpu, limit: usize, cancel: &AtomicBool, emi
         _ => None,
     }).collect();
     let _ = adapted;
-    finish_stack(cfg, gpu, limit, cancel, emit, samples, layers, (x0, y0, x1, y1), &ref_light.path, &metas)
+    finish_stack(cfg, gpu, budget, free, total, cancel, emit, samples, layers, (x0, y0, x1, y1), &ref_light.path, &metas)
 }
 
-fn finish_stack(cfg: &JobConfig, gpu: &Gpu, limit: usize, cancel: &AtomicBool, emit: &mut impl FnMut(Event), samples: Vec<SampleFrame>, channels: usize, region: (i32, i32, i32, i32), reference: &Path, metas: &[sequence::FrameMeta]) -> Result<RunOutput, String> {
+fn finish_stack(cfg: &JobConfig, gpu: &Gpu, budget: usize, free: usize, total: usize, cancel: &AtomicBool, emit: &mut impl FnMut(Event), samples: Vec<SampleFrame>, channels: usize, region: (i32, i32, i32, i32), reference: &Path, metas: &[sequence::FrameMeta]) -> Result<RunOutput, String> {
     if !cfg.output_path.is_empty() && Path::new(&cfg.output_path).exists() && !cfg.overwrite && cfg.rows.is_none() {
         return Err(format!("{} existe déjà", cfg.output_path));
     }
-    let (strip, tile) = stack::tune(samples.len(), (region.2 - region.0).max(1) as usize, limit, cfg.strip.max(8) as usize, cfg.tile.max(128) as usize);
+    let width = (region.2 - region.0).max(1) as usize;
+    let height = (region.3 - region.1).max(1) as usize;
+    let raw = matches!(samples.first().map(|sample| &sample.source), Some(SampleSource::Raw { .. }));
+    let bayer = matches!(samples.first().map(|sample| &sample.source), Some(SampleSource::Raw { lut: Some(_), .. }));
+    let accum = if raw && bayer { channels } else if raw { 1 } else { 0 };
+    let host_channels = if raw { channels.saturating_sub(1) } else { channels.max(1) };
+    let (strip, tile) = stack::geometry(
+        samples.len(),
+        width,
+        height,
+        channels.max(1),
+        accum,
+        budget,
+        stack::host_budget(),
+        stack::allowance(&samples),
+        if cfg.strip > 0 { cfg.strip as usize } else { 0 },
+        if cfg.tile > 0 { cfg.tile as usize } else { 0 },
+        host_channels,
+    );
+    emit(Event::Log { level: "info".into(), message: stack::geometry_line(strip, tile, free, total) });
     let plain = cfg.feather <= 0.0 && cfg.weighting == "none" && samples.iter().all(|sample| matches!(sample.source, SampleSource::Shift { weight: None, .. }));
     let started = Instant::now();
     let total_rows = (region.3 - region.1).max(1) as f64;
@@ -500,6 +521,7 @@ fn finish_stack(cfg: &JobConfig, gpu: &Gpu, limit: usize, cancel: &AtomicBool, e
         plain,
         strip,
         tile,
+        workers: cfg.workers.max(1) as usize,
         want_coverage: cfg.save_coverage,
     }, cancel, |done, total| {
         emit(Event::Progress { phase: "Empilement".into(), done: done as f64, total: total as f64, detail: format!("{done}/{total} bandes") });
@@ -682,14 +704,37 @@ fn warp_box(gpu: &Gpu, light: &Light, transform: &[f64; 6], lut: Option<[i32; 4]
     let bw = bw.max(1) as usize;
     let bh = bh.max(1) as usize;
     let pixels = bw * bh;
+    let layers = layers.max(1);
     let mut out = vec![0.0f32; layers * pixels];
-    let info = fits::ImageInfo::open(&light.path)?;
+    let mut file = fits::FrameFile::open(&light.path)?;
+    let width = file.info.width as i32;
+    let height = file.info.height;
+    if lut.is_some() {
+        let image = file.read_rows_vec(0, 0, height)?;
+        let mut num = gpu.zeros(layers * pixels)?;
+        let mut den = gpu.zeros(layers * pixels)?;
+        gpu.drizzle_into(&image, width, height as i32, 0, lut, -1, *transform, pixfrac as f64 * 0.5, 0, 0, bw as i32, bh as i32, &mut num, &mut den)?;
+        let nums = gpu.download(&num)?;
+        let dens = gpu.download(&den)?;
+        for channel in 0..layers {
+            for i in 0..pixels {
+                let dens_i = dens[channel * pixels + i];
+                let q = (dens_i.min(1.0) * 255.0 + 0.5).floor();
+                if q > 0.0 && dens_i > 0.0 {
+                    out[channel * pixels + i] = nums[channel * pixels + i] / dens_i;
+                }
+            }
+        }
+        return Ok(out);
+    }
+    let mut num = gpu.zeros(pixels)?;
+    let mut den = gpu.zeros(pixels)?;
     for channel in 0..layers {
-        let mut num = gpu.zeros(pixels)?;
-        let mut den = gpu.zeros(pixels)?;
-        let plane = if lut.is_some() { 0 } else { channel.min(info.channels - 1) };
-        let image = fits::read_rows(&info, plane, 0, info.height)?;
-        gpu.drizzle_into(&image, info.width as i32, info.height as i32, 0, lut, if lut.is_some() { channel as i32 } else { -1 }, *transform, pixfrac as f64 * 0.5, 0, 0, bw as i32, bh as i32, &mut num, &mut den)?;
+        let plane = channel.min(file.info.channels.saturating_sub(1));
+        let image = file.read_rows_vec(plane, 0, height)?;
+        gpu.fill(&mut num, 0)?;
+        gpu.fill(&mut den, 0)?;
+        gpu.drizzle_into(&image, width, height as i32, 0, None, -1, *transform, pixfrac as f64 * 0.5, 0, 0, bw as i32, bh as i32, &mut num, &mut den)?;
         let nums = gpu.download(&num)?;
         let dens = gpu.download(&den)?;
         for i in 0..pixels {

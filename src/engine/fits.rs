@@ -219,6 +219,7 @@ pub fn decode_sample(bitpix: i32, bytes: &[u8], bscale: f32, bzero: f32) -> f32 
     }
 }
 
+#[derive(Clone, Debug)]
 pub struct ImageInfo {
     pub header: Header,
     pub channels: usize,
@@ -249,37 +250,114 @@ impl ImageInfo {
     }
 }
 
-/// Lignes top-down `[y0, y1)` d'un plan, en f32.
-pub fn read_rows(info: &ImageInfo, plane: usize, y0: usize, y1: usize) -> Result<Vec<f32>, String> {
-    if y1 < y0 || y1 > info.height || plane >= info.channels {
-        return Err(format!("{}: lignes hors image", info.header.path.display()));
+/// Fichier FITS gardé ouvert : l'en-tête est lue une fois, les lignes partent en un seul `read`.
+pub struct FrameFile {
+    pub info: ImageInfo,
+    file: File,
+}
+
+impl FrameFile {
+    pub fn open(path: &Path) -> Result<Self, String> {
+        let info = ImageInfo::open(path)?;
+        let file = File::open(path).map_err(|err| format!("{}: {err}", path.display()))?;
+        Ok(Self { info, file })
     }
-    let item = info.header.item_size()?;
-    let width = info.width;
-    let height = info.height;
-    let rows = y1 - y0;
-    let mut file = File::open(&info.header.path).map_err(|err| err.to_string())?;
-    let mut out = vec![0.0f32; rows * width];
-    let mut raw = vec![0u8; width * item];
-    for (slot, y) in (y0..y1).enumerate() {
-        let file_row = if info.bottom_up { height - 1 - y } else { y };
-        let offset = info.header.data_offset + ((plane * height + file_row) * width * item) as u64;
-        file.seek(SeekFrom::Start(offset)).map_err(|err| err.to_string())?;
-        file.read_exact(&mut raw).map_err(|_| format!("{}: lecture trop courte", info.header.path.display()))?;
+
+    /// Remplit `out` avec les lignes visuelles `[y0, y1)`. `out` doit contenir au moins `(y1-y0) * largeur` valeurs.
+    pub fn read_rows_into(&mut self, plane: usize, y0: usize, y1: usize, out: &mut [f32]) -> Result<(), String> {
+        let info = &self.info;
+        if y1 < y0 || y1 > info.height || plane >= info.channels {
+            return Err(format!("{}: lignes hors image", info.header.path.display()));
+        }
+        let item = info.header.item_size()?;
+        let width = info.width;
+        let rows = y1 - y0;
+        if out.len() < rows * width {
+            return Err(format!("{}: tampon trop petit", info.header.path.display()));
+        }
+        if rows == 0 {
+            return Ok(());
+        }
+        let file_row0 = if info.bottom_up { info.height - y1 } else { y0 };
+        let offset = info.header.data_offset + ((plane * info.height + file_row0) * width * item) as u64;
+        self.file.seek(SeekFrom::Start(offset)).map_err(|err| format!("{}: {err}", info.header.path.display()))?;
+        let mut raw = vec![0u8; rows * width * item];
+        self.file.read_exact(&mut raw).map_err(|_| format!("{}: lecture trop courte", info.header.path.display()))?;
+        decode_block(&raw, info.bitpix, info.bscale, info.bzero, width, rows, info.bottom_up, out);
+        Ok(())
+    }
+
+    pub fn read_rows_vec(&mut self, plane: usize, y0: usize, y1: usize) -> Result<Vec<f32>, String> {
+        let rows = y1.saturating_sub(y0);
+        let mut out = vec![0.0f32; rows * self.info.width];
+        self.read_rows_into(plane, y0, y1, &mut out)?;
+        Ok(out)
+    }
+}
+
+/// Entiers 16 bits signés, même formule que le décodage scalaire. Les grandes bandes se partagent les cœurs.
+fn decode_i16(raw: &[u8], scale: f32, zero: f32, width: usize, rows: usize, bottom_up: bool, out: &mut [f32]) {
+    let heavy = width.saturating_mul(rows) >= 262_144 && rows >= 8;
+    if !heavy {
+        for slot in 0..rows {
+            decode_i16_row(raw, scale, zero, width, rows, bottom_up, slot, &mut out[slot * width..(slot + 1) * width]);
+        }
+        return;
+    }
+    let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).clamp(2, 8);
+    let chunk_rows = rows.div_ceil(threads);
+    std::thread::scope(|scope| {
+        for (band, dst) in out[..rows * width].chunks_mut(chunk_rows * width).enumerate() {
+            let row0 = band * chunk_rows;
+            scope.spawn(move || {
+                let nrows = dst.len() / width;
+                for slot in 0..nrows {
+                    decode_i16_row(raw, scale, zero, width, rows, bottom_up, row0 + slot, &mut dst[slot * width..(slot + 1) * width]);
+                }
+            });
+        }
+    });
+}
+
+fn decode_i16_row(raw: &[u8], scale: f32, zero: f32, width: usize, rows: usize, bottom_up: bool, slot: usize, dst: &mut [f32]) {
+    let src_row = if bottom_up { rows - 1 - slot } else { slot };
+    let src = &raw[src_row * width * 2..];
+    for x in 0..width {
+        let sample = i16::from_be_bytes([src[x * 2], src[x * 2 + 1]]) as f32;
+        dst[x] = (sample * scale + zero) / 65535.0;
+    }
+}
+
+/// Le bloc fichier des lignes visuelles `[y0, y1)` est contigu. En BOTTOM-UP il est rangé à l'envers.
+fn decode_block(raw: &[u8], bitpix: i32, bscale: f32, bzero: f32, width: usize, rows: usize, bottom_up: bool, out: &mut [f32]) {
+    let item = match bitpix {
+        8 => 1,
+        16 => 2,
+        32 | -32 => 4,
+        -64 => 8,
+        _ => 1,
+    };
+    if bitpix == 16 && item == 2 {
+        decode_i16(raw, bscale, bzero, width, rows, bottom_up, out);
+        return;
+    }
+    for slot in 0..rows {
+        let src_row = if bottom_up { rows - 1 - slot } else { slot };
+        let base = src_row * width * item;
         for x in 0..width {
-            out[slot * width + x] = decode_sample(info.bitpix, &raw[x * item..(x + 1) * item], info.bscale, info.bzero);
+            let bytes = &raw[base + x * item..base + (x + 1) * item];
+            out[slot * width + x] = decode_sample(bitpix, bytes, bscale, bzero);
         }
     }
-    Ok(out)
 }
 
 pub fn read_image(path: &Path) -> Result<(Vec<f32>, ImageInfo), String> {
-    let info = ImageInfo::open(path)?;
+    let mut frame = FrameFile::open(path)?;
+    let info = frame.info.clone();
     let mut data = vec![0.0f32; info.channels * info.height * info.width];
+    let plane_len = info.height * info.width;
     for plane in 0..info.channels {
-        let rows = read_rows(&info, plane, 0, info.height)?;
-        let offset = plane * info.height * info.width;
-        data[offset..offset + rows.len()].copy_from_slice(&rows);
+        frame.read_rows_into(plane, 0, info.height, &mut data[plane * plane_len..(plane + 1) * plane_len])?;
     }
     Ok((data, info))
 }
@@ -364,5 +442,61 @@ mod tests {
     fn unsigned_16_uses_bzero() {
         let sample = decode_sample(16, &32767i16.to_be_bytes(), 1.0, 32768.0);
         assert!((sample - 1.0).abs() < 1e-5, "{sample}");
+    }
+
+    #[test]
+    fn bulk_i16_bottom_up_matches_sample_decode() {
+        let dir = std::env::temp_dir().join("dubgpustack-fits-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("i16-bottom.fit");
+        let width = 4usize;
+        let height = 3usize;
+        let visual: Vec<u16> = vec![0, 100, 1000, 32768, 40000, 50000, 65535, 1, 2, 3, 4, 5];
+        write_u16(&path, width, height, true, &visual).unwrap();
+        let mut frame = FrameFile::open(&path).unwrap();
+        assert!(frame.info.bottom_up);
+        let mut out = vec![0.0f32; width * height];
+        frame.read_rows_into(0, 0, height, &mut out).unwrap();
+        for (index, value) in visual.iter().enumerate() {
+            let stored = (*value as i32 - 32768) as i16;
+            let expect = decode_sample(16, &stored.to_be_bytes(), 1.0, 32768.0);
+            assert!((out[index] - expect).abs() < 1e-6, "pixel {index}: {} != {expect}", out[index]);
+        }
+        let mut band = vec![0.0f32; width];
+        frame.read_rows_into(0, 1, 2, &mut band).unwrap();
+        for x in 0..width {
+            assert!((band[x] - out[width + x]).abs() < 1e-6);
+        }
+    }
+
+    fn write_u16(path: &Path, width: usize, height: usize, bottom_up: bool, visual: &[u16]) -> Result<(), String> {
+        let mut head = vec![
+            card("SIMPLE", FitsValue::Bool(true), ""),
+            card("BITPIX", FitsValue::Int(16), ""),
+            card("NAXIS", FitsValue::Int(2), ""),
+            card("NAXIS1", FitsValue::Int(width as i64), ""),
+            card("NAXIS2", FitsValue::Int(height as i64), ""),
+            card("BZERO", FitsValue::Float(32768.0), ""),
+            card("BSCALE", FitsValue::Float(1.0), ""),
+        ];
+        if bottom_up {
+            head.push(card("ROWORDER", FitsValue::Str("BOTTOM-UP".to_string()), ""));
+        }
+        head.push(format!("{:<80}", "END"));
+        let mut text = head.concat();
+        let padded = text.len().div_ceil(BLOCK) * BLOCK;
+        text.extend(std::iter::repeat_n(' ', padded - text.len()));
+        let mut file = File::create(path).map_err(|err| err.to_string())?;
+        file.write_all(text.as_bytes()).map_err(|err| err.to_string())?;
+        for y in (0..height).rev() {
+            for x in 0..width {
+                let stored = visual[y * width + x] as i32 - 32768;
+                file.write_all(&(stored as i16).to_be_bytes()).map_err(|err| err.to_string())?;
+            }
+        }
+        let nbytes = width * height * 2;
+        let pad = (BLOCK - (nbytes % BLOCK)) % BLOCK;
+        file.write_all(&vec![0u8; pad]).map_err(|err| err.to_string())?;
+        Ok(())
     }
 }

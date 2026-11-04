@@ -87,6 +87,7 @@ pub struct Gpu {
     drizzle: CudaFunction,
     finish_prep: CudaFunction,
     reject_mean: CudaFunction,
+    coverage_count: CudaFunction,
     ramp: CudaSlice<f32>,
 }
 
@@ -109,6 +110,7 @@ impl Gpu {
             drizzle: load("drizzle")?,
             finish_prep: load("finish_prep")?,
             reject_mean: load("reject_mean")?,
+            coverage_count: load("coverage_count")?,
             ramp,
             stream,
             _module: module,
@@ -192,13 +194,156 @@ impl Gpu {
         Ok(())
     }
 
+    pub fn copy_htod(&self, src: &[f32], dst: &mut CudaSlice<f32>) -> Result<(), String> {
+        self.stream.memcpy_htod(src, dst).map_err(|err| err.to_string())
+    }
+
+    pub fn copy_dtoh(&self, src: &CudaSlice<f32>, n: usize, dst: &mut [f32]) -> Result<(), String> {
+        let n = n.min(src.len()).min(dst.len());
+        if n == 0 {
+            return Ok(());
+        }
+        self.stream.memcpy_dtoh(&src.slice(0..n), &mut dst[..n]).map_err(|err| err.to_string())?;
+        self.stream.synchronize().map_err(|err| err.to_string())
+    }
+
+    pub fn sync(&self) -> Result<(), String> {
+        self.stream.synchronize().map_err(|err| err.to_string())
+    }
+
+    pub fn fill_prefix(&self, dst: &mut CudaSlice<f32>, n: usize, bits: u32) -> Result<(), String> {
+        let n = n.min(dst.len());
+        let mut offset = 0usize;
+        while offset < n {
+            let count = (n - offset).min(1 << 28);
+            let mut view = dst.slice_mut(offset..offset + count);
+            let count_i = count as i32;
+            klaunch!(self, count as u32, &self.fill_bits, &mut view, &count_i, &bits);
+            offset += count;
+        }
+        Ok(())
+    }
+
+    /// Tampons alloués une fois pour toutes les bandes : cube, grattage du rejet, accumulateurs.
+    /// `accum_planes` dimensionne num/den. `frame_planes` dimensionne la sortie d'une pose.
+    /// `scratch_pixels` borne le rejet à un bloc de lignes, au lieu de dupliquer tout le cube.
+    pub fn prepare(&self, pixels: usize, frames: usize, accum_planes: usize, frame_planes: usize, image_len: usize, scratch_pixels: usize) -> Result<Work, String> {
+        let pixels = pixels.max(1);
+        let frames = frames.max(1);
+        let accum_planes = accum_planes.max(1);
+        let frame_planes = frame_planes.max(1);
+        let samples = pixels.saturating_mul(frames);
+        let scratch_pixels = scratch_pixels.max(1).min(pixels);
+        let scratch_len = scratch_pixels.saturating_mul(frames);
+        let image_len = image_len.max(1);
+        Ok(Work {
+            dst_v: self.zeros(samples)?,
+            dst_w: self.zeros(samples)?,
+            scratch_v: self.zeros(scratch_len)?,
+            scratch_w: self.zeros(scratch_len)?,
+            scratch_a: self.zeros(scratch_len)?,
+            scratch_b: self.zeros(scratch_len)?,
+            scratch_c: self.zeros(scratch_len)?,
+            scratch_pixels,
+            out: self.zeros(pixels)?,
+            counters: self.stream.alloc_zeros::<i32>(3).map_err(|err| err.to_string())?,
+            num: self.zeros(pixels.saturating_mul(accum_planes))?,
+            den: self.zeros(pixels.saturating_mul(accum_planes))?,
+            frame_v: self.zeros(pixels.saturating_mul(frame_planes))?,
+            frame_w: self.zeros(pixels.saturating_mul(frame_planes))?,
+            image: self.zeros(image_len)?,
+        })
+    }
+
+}
+
+pub struct RejectSums {
+    pub values: Vec<f32>,
+    pub nlo: i32,
+    pub nhi: i32,
+    pub nvalid: i32,
+}
+
+pub struct Work {
+    pub dst_v: CudaSlice<f32>,
+    pub dst_w: CudaSlice<f32>,
+    scratch_v: CudaSlice<f32>,
+    scratch_w: CudaSlice<f32>,
+    scratch_a: CudaSlice<f32>,
+    scratch_b: CudaSlice<f32>,
+    scratch_c: CudaSlice<f32>,
+    out: CudaSlice<f32>,
+    scratch_pixels: usize,
+    counters: CudaSlice<i32>,
+    pub num: CudaSlice<f32>,
+    pub den: CudaSlice<f32>,
+    pub frame_v: CudaSlice<f32>,
+    pub frame_w: CudaSlice<f32>,
+    pub image: CudaSlice<f32>,
+}
+
+impl Gpu {
+    /// Drizzle d'une image déjà copiée dans `work.image`. `rows` est le nombre de lignes utiles au début du tampon.
     #[allow(clippy::too_many_arguments)]
-    pub fn finish_into(
+    pub fn drizzle_loaded(
         &self,
-        num: &CudaSlice<f32>,
-        den: &CudaSlice<f32>,
-        pixels: i32,
+        work: &mut Work,
+        width: i32,
+        nrows: i32,
+        y0: i32,
+        lut: Option<[i32; 4]>,
+        only_ch: i32,
+        transform: [f64; 6],
+        half: f64,
+        origin_x: i32,
+        origin_y: i32,
+        out_w: i32,
+        out_h: i32,
+    ) -> Result<(), String> {
+        if nrows <= 0 || width <= 0 {
+            return Ok(());
+        }
+        let mut coef = transform.to_vec();
+        coef.push(half);
+        let coef = self.stream.clone_htod(&coef).map_err(|err| err.to_string())?;
+        let cfa = if lut.is_some() { 1i32 } else { 0 };
+        let lut = lut.unwrap_or([0, 0, 0, 0]);
+        let count = (width as u32).saturating_mul(nrows as u32);
+        klaunch!(
+            self,
+            count,
+            &self.drizzle,
+            &work.image,
+            &width,
+            &nrows,
+            &y0,
+            &cfa,
+            &lut[0],
+            &lut[1],
+            &lut[2],
+            &lut[3],
+            &only_ch,
+            &coef,
+            &out_w,
+            &out_h,
+            &origin_x,
+            &origin_y,
+            &mut work.num,
+            &mut work.den
+        );
+        Ok(())
+    }
+
+    /// Écrit le plan `plane` de num/den. `cube_slot` ≥ 0 range la pose dans le cube (`slot * pixels`).
+    /// Sinon le plan part dans `frame_v` / `frame_w` à l'offset `dest * pixels`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn finish_plane(
+        &self,
+        work: &mut Work,
+        pixels: usize,
         tile_w: i32,
+        plane: i32,
+        dest: i32,
         a: f64,
         off: f64,
         imgw: f64,
@@ -212,24 +357,39 @@ impl Gpu {
         origin_y: i32,
         frame_x0: i32,
         frame_y0: i32,
-        dst_v: &mut CudaSlice<f32>,
-        dst_w: &mut CudaSlice<f32>,
-        slot: i32,
-        k: i32,
+        cube_slot: i32,
     ) -> Result<(), String> {
+        if pixels == 0 {
+            return Ok(());
+        }
+        let start = if cube_slot >= 0 { (cube_slot as usize).saturating_mul(pixels) } else { (dest.max(0) as usize).saturating_mul(pixels) };
+        let end = start + pixels;
+        let into_cube = cube_slot >= 0;
+        if into_cube {
+            if end > work.dst_v.len() || end > work.dst_w.len() {
+                return Ok(());
+            }
+        } else if end > work.frame_v.len() || end > work.frame_w.len() {
+            return Ok(());
+        }
         let coef = self.stream.clone_htod(&[a, off, imgw]).map_err(|err| err.to_string())?;
-        let dummy = self.zeros(1)?;
-        let (mask_ref, has_mask): (&CudaSlice<f32>, i32) = match mask {
-            Some(mask) => (mask, 1),
-            None => (&dummy, 0),
+        let has_mask = if mask.is_some() { 1i32 } else { 0 };
+        let pixels_i = pixels as i32;
+        let slot = 0i32;
+        let k = 1i32;
+        let mut dst_v = if into_cube { work.dst_v.slice_mut(start..end) } else { work.frame_v.slice_mut(start..end) };
+        let mut dst_w = if into_cube { work.dst_w.slice_mut(start..end) } else { work.frame_w.slice_mut(start..end) };
+        let mask_ref = match mask {
+            Some(mask) => mask,
+            None => &work.num,
         };
         klaunch!(
             self,
             pixels as u32,
             &self.finish_prep,
-            num,
-            den,
-            &pixels,
+            &work.num,
+            &work.den,
+            &pixels_i,
             &tile_w,
             &coef,
             &feather,
@@ -243,70 +403,94 @@ impl Gpu {
             &origin_y,
             &frame_x0,
             &frame_y0,
-            dst_v,
-            dst_w,
+            &mut dst_v,
+            &mut dst_w,
             &slot,
             &k,
-            &has_mask
+            &has_mask,
+            &plane
         );
         Ok(())
     }
 
+    /// `slot_major` : le cube est rangé pose puis pixel (`slot * pixels + pixel`). Sinon pixel puis pose.
     #[allow(clippy::too_many_arguments)]
-    pub fn reject(
-        &self,
-        values: &CudaSlice<f32>,
-        weights: &CudaSlice<f32>,
-        k: i32,
-        pixels: i32,
-        mode: i32,
-        siglow: f32,
-        sighigh: f32,
-        plain: bool,
-    ) -> Result<RejectSums, String> {
-        let scratch_len = (pixels as usize).saturating_mul(k as usize).max(1);
-        let mut scratch_v = self.zeros(scratch_len)?;
-        let mut scratch_w = self.zeros(scratch_len)?;
-        let mut scratch_a = self.zeros(scratch_len)?;
-        let mut scratch_b = self.zeros(scratch_len)?;
-        let mut scratch_c = self.zeros(scratch_len)?;
-        let mut out = self.zeros(pixels.max(0) as usize)?;
-        let counters = self.stream.alloc_zeros::<i32>(3).map_err(|err| err.to_string())?;
+    pub fn reject_loaded(&self, work: &mut Work, k: i32, pixels: i32, mode: i32, siglow: f32, sighigh: f32, plain: bool, slot_major: bool) -> Result<RejectSums, String> {
+        let full = pixels.max(0) as usize;
+        if full == 0 || k <= 0 {
+            return Ok(RejectSums { values: vec![0.0; full], nlo: 0, nhi: 0, nvalid: 0 });
+        }
+        let logical = full.saturating_mul(k as usize);
+        if logical > work.dst_v.len() || logical > work.dst_w.len() || full > work.out.len() {
+            return Err("le cube GPU est trop petit pour ce rejet".to_string());
+        }
+        self.stream.memset_zeros(&mut work.counters).map_err(|err| err.to_string())?;
         let plain_i = if plain { 1i32 } else { 0 };
-        klaunch!(
-            self,
-            pixels as u32,
-            &self.reject_mean,
-            values,
-            weights,
-            &k,
-            &pixels,
-            &mode,
-            &siglow,
-            &sighigh,
-            &plain_i,
-            &mut out,
-            &counters.slice(0..1),
-            &counters.slice(1..2),
-            &counters.slice(2..3),
-            &mut scratch_v,
-            &mut scratch_w,
-            &mut scratch_a,
-            &mut scratch_b,
-            &mut scratch_c
-        );
-        let values = self.download(&out)?;
-        let counts = self.stream.clone_dtoh(&counters).map_err(|err| err.to_string())?;
+        let slot_i = if slot_major { 1i32 } else { 0 };
+        let stride = if slot_major { pixels } else { k };
+        let chunk_cap = work.scratch_pixels.max(1);
+        let mut start = 0usize;
+        while start < full {
+            let count = (full - start).min(chunk_cap);
+            let count_i = count as i32;
+            let (v0, v1) = if slot_major { (start, logical) } else { (start.saturating_mul(k as usize), (start + count).saturating_mul(k as usize)) };
+            let scratch_n = count.saturating_mul(k as usize);
+            if scratch_n > work.scratch_v.len() {
+                return Err("le grattage GPU est trop petit pour ce rejet".to_string());
+            }
+            let values = work.dst_v.slice(v0..v1);
+            let weights = work.dst_w.slice(v0..v1);
+            let mut out = work.out.slice_mut(start..start + count);
+            let mut scratch_v = work.scratch_v.slice_mut(0..scratch_n);
+            let mut scratch_w = work.scratch_w.slice_mut(0..scratch_n);
+            let mut scratch_a = work.scratch_a.slice_mut(0..scratch_n);
+            let mut scratch_b = work.scratch_b.slice_mut(0..scratch_n);
+            let mut scratch_c = work.scratch_c.slice_mut(0..scratch_n);
+            klaunch!(
+                self,
+                count as u32,
+                &self.reject_mean,
+                &values,
+                &weights,
+                &k,
+                &count_i,
+                &stride,
+                &slot_i,
+                &mode,
+                &siglow,
+                &sighigh,
+                &plain_i,
+                &mut out,
+                &work.counters.slice(0..1),
+                &work.counters.slice(1..2),
+                &work.counters.slice(2..3),
+                &mut scratch_v,
+                &mut scratch_w,
+                &mut scratch_a,
+                &mut scratch_b,
+                &mut scratch_c
+            );
+            start += count;
+        }
+        let mut values = vec![0.0f32; full];
+        self.copy_dtoh(&work.out, full, &mut values)?;
+        let counts = self.stream.clone_dtoh(&work.counters).map_err(|err| err.to_string())?;
         self.stream.synchronize().map_err(|err| err.to_string())?;
         Ok(RejectSums { values, nlo: counts.first().copied().unwrap_or(0), nhi: counts.get(1).copied().unwrap_or(0), nvalid: counts.get(2).copied().unwrap_or(0) })
     }
-}
 
-pub struct RejectSums {
-    pub values: Vec<f32>,
-    pub nlo: i32,
-    pub nhi: i32,
-    pub nvalid: i32,
+    /// Couverture d'un cube rangé par pose : nombre de poids > 0 pour chaque pixel.
+    pub fn coverage_slots(&self, weights: &CudaSlice<f32>, k: i32, pixels: i32, dst: &mut [i32]) -> Result<(), String> {
+        let n = pixels.max(0) as usize;
+        if n == 0 || k <= 0 {
+            return Ok(());
+        }
+        let mut out = self.stream.alloc_zeros::<i32>(n).map_err(|err| err.to_string())?;
+        klaunch!(self, pixels as u32, &self.coverage_count, weights, &k, &pixels, &mut out);
+        let n = n.min(dst.len());
+        self.stream.memcpy_dtoh(&out.slice(0..n), &mut dst[..n]).map_err(|err| err.to_string())?;
+        self.stream.synchronize().map_err(|err| err.to_string())
+    }
 }
 
 #[cfg(test)]
@@ -359,15 +543,13 @@ mod tests {
 
     fn launch_sample(gpu: &Gpu) {
         let image = vec![0.4f32; 64 * 48];
-        let mut num = gpu.zeros(64 * 48).expect("num");
-        let mut den = gpu.zeros(64 * 48).expect("den");
-        gpu.drizzle_into(&image, 64, 48, 0, Some([1, 0, 2, 1]), 0, [1.0, 0.0, 0.0, 0.0, 1.0, 0.0], 0.5, 0, 0, 64, 48, &mut num, &mut den).expect("drizzle");
-        let mut dst_v = gpu.zeros(64 * 48).expect("valeurs");
-        let mut dst_w = gpu.zeros(64 * 48).expect("poids");
-        gpu.finish_into(&num, &den, 64 * 48, 64, 1.0, 0.0, 1.0, 0.0, None, 0, 0, 64, 48, 0, 0, 0, 0, &mut dst_v, &mut dst_w, 0, 1).expect("finish");
-        let values = gpu.upload(&[1.0, 1.0, 2.0, 1.0]).expect("values");
-        let weights = gpu.upload(&[1.0, 1.0, 1.0, 1.0]).expect("weights");
-        gpu.reject(&values, &weights, 2, 2, 2, 3.0, 3.0, false).expect("rejet");
+        let mut work = gpu.prepare(64 * 48, 2, 1, 1, 64 * 48, 64 * 48).expect("tampons");
+        gpu.copy_htod(&image, &mut work.image).expect("copie");
+        gpu.drizzle_loaded(&mut work, 64, 48, 0, Some([1, 0, 2, 1]), 0, [1.0, 0.0, 0.0, 0.0, 1.0, 0.0], 0.5, 0, 0, 64, 48).expect("drizzle");
+        gpu.finish_plane(&mut work, 64 * 48, 64, 0, 0, 1.0, 0.0, 1.0, 0.0, None, 0, 0, 64, 48, 0, 0, 0, 0, -1).expect("finish");
+        gpu.copy_htod(&[1.0, 1.0, 2.0, 1.0], &mut work.dst_v).expect("valeurs");
+        gpu.copy_htod(&[1.0, 1.0, 1.0, 1.0], &mut work.dst_w).expect("poids");
+        gpu.reject_loaded(&mut work, 2, 2, 2, 3.0, 3.0, false, false).expect("rejet");
     }
 }
 

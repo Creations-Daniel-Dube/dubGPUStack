@@ -431,7 +431,7 @@ impl App {
         if included_files.len() < 2 && !analyze_only {
             return Err("sélectionnez au moins deux images".to_string());
         }
-        let mut cfg = JobConfig {
+        let cfg = JobConfig {
             seq_path: if loaded.lights { String::new() } else { loaded.path.clone() },
             lights_dir: if loaded.lights { loaded.path.clone() } else { String::new() },
             output_path: if rows.is_some() || analyze_only { String::new() } else { self.output_path.clone() },
@@ -450,17 +450,15 @@ impl App {
             rows,
             save_coverage: self.settings.save_coverage,
             gpu_mem_gib: self.settings.gpu_mem_gib,
-            strip: if loaded.lights { self.settings.strip.max(64) } else { self.settings.strip },
+            strip: self.settings.strip,
             tile: self.settings.tile,
+            workers: self.settings.workers,
             overwrite: self.confirm,
             drizzle_scale: self.settings.drizzle_scale,
             pixfrac: self.settings.pixfrac,
             transform: self.settings.transform.clone(),
             analyze_only,
         };
-        if loaded.lights && cfg.strip < 64 {
-            cfg.strip = 64;
-        }
         cfg.validate()?;
         Ok(cfg)
     }
@@ -675,10 +673,10 @@ impl App {
                 ui.add(DragValue::new(&mut self.settings.gpu_mem_gib).range(0.0..=128.0).speed(0.5).suffix(" Gio"));
                 ui.label("Fils CPU");
                 ui.add(DragValue::new(&mut self.settings.workers).range(1..=64));
-                ui.label("Bande");
-                ui.add(DragValue::new(&mut self.settings.strip).range(8..=2048));
-                ui.label("Tuile");
-                ui.add(DragValue::new(&mut self.settings.tile).range(32..=4096));
+                ui.label("Bande max (0 = auto)");
+                ui.add(DragValue::new(&mut self.settings.strip).range(0..=8192));
+                ui.label("Tuile max (0 = auto)");
+                ui.add(DragValue::new(&mut self.settings.tile).range(0..=16384));
             });
         });
     }

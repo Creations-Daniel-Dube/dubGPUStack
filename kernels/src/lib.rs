@@ -186,11 +186,15 @@ mod device {
         slot: i32,
         k: i32,
         has_mask: i32,
+        plane: i32,
     ) {
         let p = global_x() as i32;
         if p >= pixels || k <= 0 || tile_w <= 0 {
             return;
         }
+        let stride = pixels as usize;
+        let num = unsafe { num.add((plane.max(0) as usize).wrapping_mul(stride)) };
+        let den = unsafe { den.add((plane.max(0) as usize).wrapping_mul(stride)) };
         let wden = unsafe { *den.add(p as usize) };
         let q = floor_f32(wden.min(1.0) * 255.0 + 0.5) as i32;
         let base = (p as usize).wrapping_mul(k as usize).wrapping_add(slot as usize);
@@ -255,6 +259,8 @@ mod device {
         weights: *const f32,
         k: i32,
         pixels: i32,
+        stride: i32,
+        slot_major: i32,
         mode: i32,
         siglow: f32,
         sighigh: f32,
@@ -275,14 +281,16 @@ mod device {
         }
         let kk = k as usize;
         let src = p.wrapping_mul(kk);
+        let step = stride.max(1) as usize;
         let mut n = 0usize;
         let mut i = 0usize;
         while i < kk {
-            let v = unsafe { *values.add(src + i) };
+            let at = if slot_major != 0 { i.wrapping_mul(step).wrapping_add(p) } else { src.wrapping_add(i) };
+            let v = unsafe { *values.add(at) };
             if !v.is_nan() {
                 unsafe {
                     *scratch_v.add(src + n) = v;
-                    *scratch_w.add(src + n) = *weights.add(src + i);
+                    *scratch_w.add(src + n) = *weights.add(at);
                 }
                 n += 1;
             }
@@ -306,6 +314,25 @@ mod device {
                 atomic_add_i32(nvalid, result.nvalid);
             }
         }
+    }
+
+    /// Compte, par pixel, les poses dont le poids est strictement positif. `weights` est rangé par pose.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "ptx-kernel" fn coverage_count(weights: *const f32, k: i32, pixels: i32, out: *mut i32) {
+        let p = global_x() as usize;
+        if p >= pixels as usize || k <= 0 {
+            return;
+        }
+        let mut n = 0i32;
+        let mut i = 0i32;
+        while i < k {
+            let weight = unsafe { *weights.add((i as usize).wrapping_mul(pixels as usize).wrapping_add(p)) };
+            if weight > 0.0 {
+                n += 1;
+            }
+            i += 1;
+        }
+        unsafe { *out.add(p) = n };
     }
 
     #[unsafe(no_mangle)]

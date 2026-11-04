@@ -23,6 +23,8 @@ pub struct Settings {
     pub workers: i32,
     pub strip: i32,
     pub tile: i32,
+    #[serde(default = "legacy_band")]
+    pub band_migrated: bool,
     pub gpu_mem_gib: f64,
     pub save_coverage: bool,
     pub crop: bool,
@@ -47,8 +49,9 @@ impl Default for Settings {
             drizzle_scale: 1.0,
             transform: "affine".to_string(),
             workers: 6,
-            strip: 64,
-            tile: 1024,
+            strip: 0,
+            tile: 0,
+            band_migrated: true,
             gpu_mem_gib: 0.0,
             save_coverage: false,
             crop: false,
@@ -61,7 +64,16 @@ impl Default for Settings {
 impl Settings {
     pub fn load() -> Self {
         let Ok(text) = std::fs::read_to_string(settings_path()) else { return Self::default() };
-        serde_json::from_str(&text).unwrap_or_default()
+        let mut settings: Self = serde_json::from_str(&text).unwrap_or_default();
+        if !settings.band_migrated {
+            if settings.strip == 64 && settings.tile == 1024 {
+                settings.strip = 0;
+                settings.tile = 0;
+            }
+            settings.band_migrated = true;
+            settings.save();
+        }
+        settings
     }
 
     pub fn save(&self) {
@@ -83,6 +95,10 @@ impl Settings {
         }
         self.save();
     }
+}
+
+fn legacy_band() -> bool {
+    false
 }
 
 pub fn settings_path() -> PathBuf {
