@@ -87,6 +87,7 @@ pub struct App {
     crop_y: i32,
     crop_w: i32,
     crop_h: i32,
+    advanced_open: bool,
     open_at_start: Option<String>,
 }
 
@@ -119,6 +120,7 @@ impl App {
             crop_y: 0,
             crop_w: 0,
             crop_h: 0,
+            advanced_open: true,
             open_at_start: open,
         };
         match gpu::probe_gpu() {
@@ -570,13 +572,13 @@ impl App {
     fn ui_bar(&mut self, ui: &mut egui::Ui) {
         egui::MenuBar::new().ui(ui, |ui| {
             ui.menu_button("Fichier", |ui| {
-                if ui.button("Ouvrir un dossier de brutes…").clicked() {
+                if ui.button("Ouvrir un dossier de brutes…").on_hover_text("Ouvre un dossier d'images brutes.").clicked() {
                     if let Some(path) = rfd::FileDialog::new().set_directory(&self.settings.last_dir).pick_folder() {
                         self.open_path(&path);
                     }
                     ui.close();
                 }
-                if ui.button("Ouvrir une séquence Siril…").clicked() {
+                if ui.button("Ouvrir une séquence Siril…").on_hover_text("Ouvre un fichier de séquence Siril (.seq).").clicked() {
                     if let Some(path) = rfd::FileDialog::new().set_directory(&self.settings.last_dir).add_filter("Séquence", &["seq"]).pick_file() {
                         self.open_path(&path);
                     }
@@ -586,21 +588,21 @@ impl App {
                     let recent = self.settings.recent.clone();
                     if recent.is_empty() { ui.label("aucun"); }
                     for path in recent {
-                        if ui.button(&path).clicked() {
+                        if ui.button(&path).on_hover_text("Rouvre ce dossier ou cette séquence.").clicked() {
                             self.open_path(Path::new(&path));
                             ui.close();
                         }
                     }
-                });
-                if ui.button("Recharger").clicked() {
+                }).response.on_hover_text("Rouvre un dossier ou une séquence récents.");
+                if ui.button("Recharger").on_hover_text("Relit le dossier ou la séquence déjà ouvert.").clicked() {
                     if let Some(path) = self.loaded.as_ref().map(|loaded| loaded.path.clone()) {
                         self.open_path(Path::new(&path));
                     }
                     ui.close();
                 }
-                if ui.button("Empiler").clicked() { self.start(false, false); ui.close(); }
-                if ui.button("Quitter").clicked() { ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close); }
-            });
+                if ui.button("Empiler").on_hover_text("Empile les images sélectionnées et écrit le FITS.").clicked() { self.start(false, false); ui.close(); }
+                if ui.button("Quitter").on_hover_text("Ferme dubGPUStack.").clicked() { ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close); }
+            }).response.on_hover_text("Ouvrir, recharger ou quitter.");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.label(RichText::new(&self.gpu_line).small());
             });
@@ -617,10 +619,10 @@ impl App {
                     ui.label(format!("{}×{} · {} images · {}", loaded.width, loaded.height, loaded.rows.len(), if loaded.lights { "brutes" } else { "séquence" }));
                 }
                 ui.horizontal(|ui| {
-                    if ui.button("Brutes…").clicked() {
+                    if ui.button("Brutes…").on_hover_text("Ouvre un dossier d'images brutes.").clicked() {
                         if let Some(path) = rfd::FileDialog::new().set_directory(&self.settings.last_dir).pick_folder() { self.open_path(&path); }
                     }
-                    if ui.button("Séquence…").clicked() {
+                    if ui.button("Séquence…").on_hover_text("Ouvre un fichier de séquence Siril (.seq).").clicked() {
                         if let Some(path) = rfd::FileDialog::new().set_directory(&self.settings.last_dir).add_filter("Séquence", &["seq"]).pick_file() { self.open_path(&path); }
                     }
                 });
@@ -628,60 +630,73 @@ impl App {
             let lights = self.loaded.as_ref().is_some_and(|loaded| loaded.lights);
             if lights {
                 group(ui, "Registration et drizzle", |ui| {
-                    combo_str(ui, "alignement", &mut self.settings.transform, &[("affine", "Affine"), ("similarity", "Similitude")]);
-                    combo(ui, "échelle", &mut self.settings.drizzle_scale, &[(1.0, "1×"), (1.5, "1,5×"), (2.0, "2×"), (3.0, "3×")]);
-                    ui.label("Pixfrac");
-                    ui.add(DragValue::new(&mut self.settings.pixfrac).range(0.05..=1.0).speed(0.01).fixed_decimals(2));
+                    combo_str(ui, "alignement", &mut self.settings.transform, &[("affine", "Affine"), ("similarity", "Similitude")], "Affine autorise une déformation. Similitude se limite à la translation, la rotation et l'échelle.");
+                    combo(ui, "échelle", &mut self.settings.drizzle_scale, &[(1.0, "1×"), (1.5, "1,5×"), (2.0, "2×"), (3.0, "3×")], "Agrandissement drizzle du canevas.");
+                    let pixfrac = "Taille de la goutte drizzle. 1 couvre un pixel entier.";
+                    ui.label("Pixfrac").on_hover_text(pixfrac);
+                    ui.add(DragValue::new(&mut self.settings.pixfrac).range(0.05..=1.0).speed(0.01).fixed_decimals(2)).on_hover_text(pixfrac);
                 });
             }
-            group(ui, "Empilement", |ui| {
-                combo_str(ui, "rejet", &mut self.settings.rejection, &[("winsorized", "Winsorisé"), ("sigma", "Sigma"), ("none", "Aucun")]);
-                ui.horizontal(|ui| {
-                    ui.label("Sigma bas");
-                    ui.add(DragValue::new(&mut self.settings.sigma_low).range(0.1..=10.0).speed(0.1).fixed_decimals(1));
-                    ui.label("haut");
-                    ui.add(DragValue::new(&mut self.settings.sigma_high).range(0.1..=10.0).speed(0.1).fixed_decimals(1));
-                });
-                combo_str(ui, "pondération", &mut self.settings.weighting, &[("noise", "Bruit"), ("wfwhm", "wFWHM"), ("nbstars", "Étoiles"), ("none", "Aucune")]);
-                combo_str(ui, "normalisation", &mut self.settings.normalization, &[("addscale", "Additive + échelle"), ("none", "Aucune")]);
-                ui.checkbox(&mut self.settings.rgb_equal, "Égaliser RVB");
-                ui.label("Fondu (pixels de masque)");
-                ui.add(DragValue::new(&mut self.settings.feather).range(0.0..=500.0).speed(1.0).fixed_decimals(0));
-                ui.checkbox(&mut self.settings.output_norm, "Normaliser la sortie 0–1");
-            });
             group(ui, "Sortie", |ui| {
-                ui.checkbox(&mut self.settings.crop, "Recadrer par couverture");
+                ui.checkbox(&mut self.settings.crop, "Recadrer par couverture").on_hover_text("Garde la zone couverte par assez d'images.");
                 if self.settings.crop {
-                    ui.label("Images minimum");
-                    if ui.add(DragValue::new(&mut self.settings.min_coverage).range(1..=9999).speed(1.0)).changed() { self.apply_crop(); }
+                    let minimum = "Nombre d'images requis pour garder un pixel dans le cadre.";
+                    ui.label("Images minimum").on_hover_text(minimum);
+                    if ui.add(DragValue::new(&mut self.settings.min_coverage).range(1..=9999).speed(1.0)).on_hover_text(minimum).changed() { self.apply_crop(); }
                     ui.horizontal(|ui| {
-                        ui.add(DragValue::new(&mut self.crop_x).range(0..=200000).prefix("x "));
-                        ui.add(DragValue::new(&mut self.crop_y).range(0..=200000).prefix("y "));
+                        ui.add(DragValue::new(&mut self.crop_x).range(0..=200000).prefix("x ")).on_hover_text("Bord gauche du recadrage, en pixels.");
+                        ui.add(DragValue::new(&mut self.crop_y).range(0..=200000).prefix("y ")).on_hover_text("Bord haut du recadrage, en pixels.");
                     });
                     ui.horizontal(|ui| {
-                        ui.add(DragValue::new(&mut self.crop_w).range(0..=200000).prefix("l "));
-                        ui.add(DragValue::new(&mut self.crop_h).range(0..=200000).prefix("h "));
+                        ui.add(DragValue::new(&mut self.crop_w).range(0..=200000).prefix("l ")).on_hover_text("Largeur du recadrage, en pixels.");
+                        ui.add(DragValue::new(&mut self.crop_h).range(0..=200000).prefix("h ")).on_hover_text("Hauteur du recadrage, en pixels.");
                     });
                 }
-                if ui.button("Choisir le fichier de sortie…").clicked() {
+                if ui.button("Choisir le fichier de sortie…").on_hover_text("Choisit le fichier FITS écrit par l'empilement.").clicked() {
                     if let Some(path) = rfd::FileDialog::new().set_directory(&self.settings.last_dir).add_filter("FITS", &["fit", "fits"]).save_file() {
                         self.output_path = path.display().to_string();
                         self.confirm = false;
                     }
                 }
-                ui.label(if self.output_path.is_empty() { "Nom automatique".to_string() } else { short_path(&self.output_path) });
-                ui.checkbox(&mut self.settings.save_coverage, "Carte de couverture");
+                let name_tip = if self.output_path.is_empty() { "Nom choisi automatiquement à l'empilement." } else { "Fichier de sortie actuel." };
+                ui.label(if self.output_path.is_empty() { "Nom automatique".to_string() } else { short_path(&self.output_path) }).on_hover_text(name_tip);
+                ui.checkbox(&mut self.settings.save_coverage, "Carte de couverture").on_hover_text("Écrit aussi la carte du nombre d'images par pixel.");
             });
-            group(ui, "Options avancées", |ui| {
-                ui.label("Mémoire GPU (0 = 75 %)");
-                ui.add(DragValue::new(&mut self.settings.gpu_mem_gib).range(0.0..=128.0).speed(0.5).suffix(" Gio"));
-                ui.label("Fils CPU");
-                ui.add(DragValue::new(&mut self.settings.workers).range(1..=64));
-                ui.label("Bande max (0 = auto)");
-                ui.add(DragValue::new(&mut self.settings.strip).range(0..=8192));
-                ui.label("Tuile max (0 = auto)");
-                ui.add(DragValue::new(&mut self.settings.tile).range(0..=16384));
-            });
+            advanced_toggle(ui, &mut self.advanced_open);
+            if self.advanced_open {
+                group(ui, "Empilement", |ui| {
+                    combo_str(ui, "rejet", &mut self.settings.rejection, &[("winsorized", "Winsorisé"), ("sigma", "Sigma"), ("none", "Aucun")], "Winsorisé adoucit les écarts, sigma les coupe, aucun garde tout.");
+                    let low = "Seuil de rejet des pixels trop sombres.";
+                    let high = "Seuil de rejet des pixels trop brillants.";
+                    ui.horizontal(|ui| {
+                        ui.label("Sigma bas").on_hover_text(low);
+                        ui.add(DragValue::new(&mut self.settings.sigma_low).range(0.1..=10.0).speed(0.1).fixed_decimals(1)).on_hover_text(low);
+                        ui.label("haut").on_hover_text(high);
+                        ui.add(DragValue::new(&mut self.settings.sigma_high).range(0.1..=10.0).speed(0.1).fixed_decimals(1)).on_hover_text(high);
+                    });
+                    combo_str(ui, "pondération", &mut self.settings.weighting, &[("noise", "Bruit"), ("wfwhm", "wFWHM"), ("nbstars", "Étoiles"), ("none", "Aucune")], "Poids de chaque image : bruit, FWHM, nombre d'étoiles, ou poids égal.");
+                    combo_str(ui, "normalisation", &mut self.settings.normalization, &[("addscale", "Additive + échelle"), ("none", "Aucune")], "Met le fond et l'échelle des images au même niveau, ou les laisse tels quels.");
+                    ui.checkbox(&mut self.settings.rgb_equal, "Égaliser RVB").on_hover_text("Aligne le fond des trois couches couleur.");
+                    let feather = "Lisse le bord des masques, en pixels.";
+                    ui.label("Fondu (pixels de masque)").on_hover_text(feather);
+                    ui.add(DragValue::new(&mut self.settings.feather).range(0.0..=500.0).speed(1.0).fixed_decimals(0)).on_hover_text(feather);
+                    ui.checkbox(&mut self.settings.output_norm, "Normaliser la sortie 0–1").on_hover_text("Ramène le FITS écrit entre 0 et 1.");
+                });
+                group(ui, "Carte Vidéo / GPU", |ui| {
+                    let memory = "Plafond de mémoire GPU, en Gio. 0 utilise 75 % de la carte.";
+                    ui.label("Mémoire GPU (0 = 75 %)").on_hover_text(memory);
+                    ui.add(DragValue::new(&mut self.settings.gpu_mem_gib).range(0.0..=128.0).speed(0.5).suffix(" Gio")).on_hover_text(memory);
+                    let workers = "Nombre de fils qui lisent les images.";
+                    ui.label("Fils CPU").on_hover_text(workers);
+                    ui.add(DragValue::new(&mut self.settings.workers).range(1..=64)).on_hover_text(workers);
+                    let strip = "Hauteur maximale d'une bande, en lignes. 0 laisse le logiciel choisir.";
+                    ui.label("Bande max (0 = auto)").on_hover_text(strip);
+                    ui.add(DragValue::new(&mut self.settings.strip).range(0..=8192)).on_hover_text(strip);
+                    let tile = "Côté maximal d'une tuile, en pixels. 0 laisse le logiciel choisir.";
+                    ui.label("Tuile max (0 = auto)").on_hover_text(tile);
+                    ui.add(DragValue::new(&mut self.settings.tile).range(0..=16384)).on_hover_text(tile);
+                });
+            }
         });
     }
 
@@ -702,13 +717,13 @@ impl App {
         }
         if self.busy {
             ui.add(egui::ProgressBar::new(self.fraction.clamp(0.0, 1.0)).text(self.phase_text()));
-            if ui.button("Annuler").clicked() { self.cancel_job(); }
+            if ui.button("Annuler").on_hover_text("Interrompt le calcul en cours.").clicked() { self.cancel_job(); }
         }
         if self.confirm {
             ui.label("Le fichier de sortie existe déjà.");
             ui.horizontal(|ui| {
-                if ui.button("Écraser").clicked() { self.start(false, false); }
-                if ui.button("Garder").clicked() { self.confirm = false; }
+                if ui.button("Écraser").on_hover_text("Remplace le fichier de sortie existant.").clicked() { self.start(false, false); }
+                if ui.button("Garder").on_hover_text("Annule l'écriture et conserve le fichier existant.").clicked() { self.confirm = false; }
             });
         }
         if !self.busy {
@@ -720,7 +735,7 @@ impl App {
         if self.busy {
             ui.label(RichText::new(self.phase_text()).color(Color32::from_rgb(0xff, 0xe1, 0x4d)).strong());
             ui.add(egui::ProgressBar::new(self.fraction.clamp(0.0, 1.0)));
-            if ui.button("Annuler").clicked() { self.cancel_job(); }
+            if ui.button("Annuler").on_hover_text("Interrompt le calcul en cours.").clicked() { self.cancel_job(); }
             ui.separator();
         } else if !self.summary.is_empty() {
             ui.label(RichText::new(&self.summary).color(self.status_color()).strong());
@@ -781,12 +796,12 @@ impl App {
                 for metric in [Metric::Fwhm, Metric::Roundness, Metric::Stars, Metric::Background, Metric::Noise] {
                     ui.selectable_value(&mut self.metric, metric, format!("{}  —  {}", metric_name(metric), metric_gloss(metric)));
                 }
-            });
-            if ui.button("Inclure").clicked() { include = true; }
-            if ui.button("Exclure").clicked() { exclude = true; }
-            if ui.button("Exclure les pires").clicked() { worst = true; }
-            if ui.button("Réinitialiser").clicked() { reset = true; }
-            if ui.button("Référence").clicked() { set_ref = true; }
+            }).response.on_hover_text("Grandeur tracée pour comparer les images.");
+            if ui.button("Inclure").on_hover_text("Garde l'image sélectionnée dans l'empilement.").clicked() { include = true; }
+            if ui.button("Exclure").on_hover_text("Retire l'image sélectionnée de l'empilement.").clicked() { exclude = true; }
+            if ui.button("Exclure les pires").on_hover_text("Retire environ 10 % des images les moins nettes.").clicked() { worst = true; }
+            if ui.button("Réinitialiser").on_hover_text("Coche toutes les images et efface la référence.").clicked() { reset = true; }
+            if ui.button("Référence").on_hover_text("Utilise l'image sélectionnée comme référence d'alignement.").clicked() { set_ref = true; }
         });
         let metric = self.metric;
         ui.horizontal(|ui| {
@@ -846,10 +861,10 @@ impl App {
         egui::ScrollArea::vertical().max_height(ui.available_height()).show(ui, |ui| {
             for (index, row) in loaded.rows.iter_mut().enumerate() {
                 ui.horizontal(|ui| {
-                    if ui.checkbox(&mut row.included, "").changed() { changed = true; }
+                    if ui.checkbox(&mut row.included, "").on_hover_text("Inclut ou exclut cette image de l'empilement.").changed() { changed = true; }
                     let star = if row.key == reference || row.filenum.to_string() == reference { "★ " } else { "" };
                     let text = format!("{star}{}   FWHM {:.2}   rond. {:.2}   ét. {}   fond {:.4}   bruit {:.5}", row.label, row.fwhm, row.roundness, row.nstars, row.background, row.noise);
-                    if ui.selectable_label(selected == Some(index), text).clicked() { selected_now = Some(index); }
+                    if ui.selectable_label(selected == Some(index), text).on_hover_text("Sélectionne cette image.").clicked() { selected_now = Some(index); }
                 });
             }
         });
@@ -888,10 +903,10 @@ impl eframe::App for App {
         egui::Panel::left("reglages").resizable(true).exact_size(340.0).show(ui, |ui| self.sidebar(ui));
         egui::Panel::bottom("etat").show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.selectable_value(&mut self.tab, Tab::Canvas, "Canevas");
-                ui.selectable_value(&mut self.tab, Tab::Frames, "Images");
-                ui.selectable_value(&mut self.tab, Tab::Result, "Résultat");
-                ui.selectable_value(&mut self.tab, Tab::Log, "Journal");
+                ui.selectable_value(&mut self.tab, Tab::Canvas, "Canevas").on_hover_text("Montre la couverture ou l'aperçu.");
+                ui.selectable_value(&mut self.tab, Tab::Frames, "Images").on_hover_text("Courbe de qualité et choix des images à empiler.");
+                ui.selectable_value(&mut self.tab, Tab::Result, "Résultat").on_hover_text("Aperçu de l'image écrite.");
+                ui.selectable_value(&mut self.tab, Tab::Log, "Journal").on_hover_text("Messages du calcul en cours ou terminé.");
                 ui.separator();
                 if self.busy {
                     ui.add(egui::ProgressBar::new(self.fraction.clamp(0.0, 1.0)).desired_width(160.0));
@@ -939,19 +954,19 @@ fn panic_text(payload: Box<dyn std::any::Any + Send>) -> String {
 
 impl App {
     fn result_tab(&mut self, ui: &mut egui::Ui) {
-        ui.checkbox(&mut self.linked, "Étirement lié");
+        ui.checkbox(&mut self.linked, "Étirement lié").on_hover_text("Lie les trois couches pour l'étirement de l'aperçu.");
         if let Some(tex) = &self.preview {
             show_fitted_image(ui, tex, text_line(ui) + ui.spacing().interact_size.y + ui.spacing().item_spacing.y);
         }
         ui.label(if self.result_path.is_empty() { "Pas encore d'image écrite".to_string() } else { self.result_path.clone() });
         ui.horizontal(|ui| {
-            if ui.button("Ouvrir").clicked() && !self.result_path.is_empty() {
+            if ui.button("Ouvrir").on_hover_text("Ouvre l'image écrite.").clicked() && !self.result_path.is_empty() {
                 let _ = std::process::Command::new("explorer").arg(&self.result_path).spawn();
             }
-            if ui.button("Dossier").clicked() && !self.result_path.is_empty() {
+            if ui.button("Dossier").on_hover_text("Montre le fichier dans son dossier.").clicked() && !self.result_path.is_empty() {
                 let _ = std::process::Command::new("explorer").args(["/select,", &self.result_path]).spawn();
             }
-            if ui.button("Copier le chemin").clicked() && !self.result_path.is_empty() {
+            if ui.button("Copier le chemin").on_hover_text("Copie le chemin du fichier dans le presse-papiers.").clicked() && !self.result_path.is_empty() {
                 ui.ctx().copy_text(self.result_path.clone());
             }
         });
@@ -959,12 +974,12 @@ impl App {
 
     fn log_tab(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            if ui.button("Effacer").clicked() { self.log.clear(); }
-            if ui.button("Copier").clicked() {
+            if ui.button("Effacer").on_hover_text("Vide le journal.").clicked() { self.log.clear(); }
+            if ui.button("Copier").on_hover_text("Copie le journal dans le presse-papiers.").clicked() {
                 let text = self.log.iter().map(|(level, message)| format!("[{level}] {message}")).collect::<Vec<_>>().join("\n");
                 ui.ctx().copy_text(text);
             }
-            if ui.button("Enregistrer…").clicked() {
+            if ui.button("Enregistrer…").on_hover_text("Enregistre le journal dans un fichier texte.").clicked() {
                 if let Some(path) = rfd::FileDialog::new().set_file_name("journal.txt").save_file() {
                     let text = self.log.iter().map(|(level, message)| format!("[{level}] {message}")).collect::<Vec<_>>().join("\n");
                     let _ = std::fs::write(path, text);
@@ -1024,6 +1039,20 @@ fn install_font(ctx: &egui::Context) {
     ctx.add_font(egui::FontInsert::new("stack-bold", egui::FontData::from_owned(bytes), vec![egui::InsertFontFamily { family: egui::FontFamily::Proportional, priority: egui::FontPriority::Highest }]));
 }
 
+fn advanced_toggle(ui: &mut egui::Ui, open: &mut bool) {
+    ui.add_space(6.0);
+    let help = "Affiche ou cache Empilement et Carte Vidéo / GPU.";
+    let clicked = ui.horizontal(|ui| {
+        let title = ui.add(egui::Label::new(RichText::new("Fonctions avancées").strong()).sense(egui::Sense::click())).on_hover_text(help);
+        let icon = if *open { "▼" } else { "▲" };
+        let mark = ui.add(egui::Label::new(RichText::new(icon).color(Color32::from_rgb(0xff, 0xe1, 0x4d)).strong()).sense(egui::Sense::click())).on_hover_text(help);
+        title.clicked() || mark.clicked()
+    }).inner;
+    if clicked {
+        *open = !*open;
+    }
+}
+
 fn group(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui)) {
     ui.add_space(6.0);
     ui.label(RichText::new(title).strong());
@@ -1038,7 +1067,7 @@ fn short_path(path: &str) -> String {
     path.file_name().and_then(|name| name.to_str()).unwrap_or(path.to_str().unwrap_or("")).to_string()
 }
 
-fn combo_str(ui: &mut egui::Ui, salt: &str, value: &mut String, choices: &[(&str, &str)]) {
+fn combo_str(ui: &mut egui::Ui, salt: &str, value: &mut String, choices: &[(&str, &str)], help: &str) {
     let current = choices.iter().find(|(item, _)| item == value).map(|(_, label)| *label).unwrap_or(value.as_str());
     ComboBox::from_id_salt(salt).selected_text(current).show_ui(ui, |ui| {
         for (item, label) in choices {
@@ -1046,16 +1075,16 @@ fn combo_str(ui: &mut egui::Ui, salt: &str, value: &mut String, choices: &[(&str
                 *value = (*item).to_string();
             }
         }
-    });
+    }).response.on_hover_text(help);
 }
 
-fn combo<T: PartialEq + Copy + 'static>(ui: &mut egui::Ui, salt: &str, value: &mut T, choices: &[(T, &str)]) {
+fn combo<T: PartialEq + Copy + 'static>(ui: &mut egui::Ui, salt: &str, value: &mut T, choices: &[(T, &str)], help: &str) {
     let current = choices.iter().find(|(item, _)| item == value).map(|(_, label)| *label).unwrap_or("");
     ComboBox::from_id_salt(salt).selected_text(current).show_ui(ui, |ui| {
         for (item, label) in choices {
             ui.selectable_value(value, *item, *label);
         }
-    });
+    }).response.on_hover_text(help);
 }
 
 fn metric_name(metric: Metric) -> &'static str {
