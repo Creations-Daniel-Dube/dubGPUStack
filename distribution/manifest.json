@@ -15,7 +15,7 @@
     {"asset": "cublas64_12.dll", "dest": "cublas64_12.dll", "cuda": "cublas64_12.dll"},
     {"asset": "cublasLt64_12.dll", "dest": "cublasLt64_12.dll", "cuda": "cublasLt64_12.dll"},
     {"asset": "cudart64_12.dll", "dest": "cudart64_12.dll", "cuda": "cudart64_12.dll"},
-    {"asset": "cudnn64_9.dll", "dest": "cudnn64_9.dll", "cuda": "cudnn64_9.dll"},
+    {"asset": "cudnn64_9.dll", "dest": "cudnn64_9.dll", "cuda": "cudnn64_9.dll", "optional": true},
     {"asset": "cufft64_11.dll", "dest": "cufft64_11.dll", "cuda": "cufft64_11.dll"},
     {"asset": "nvrtc64_120_0.dll", "dest": "nvrtc64_120_0.dll", "cuda": "nvrtc64_120_0.dll"},
     {"asset": "nvrtc-builtins64_128.dll", "dest": "nvrtc-builtins64_128.dll", "cuda": "nvrtc-builtins64_128.dll"}

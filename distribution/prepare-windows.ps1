@@ -33,7 +33,7 @@ function Copy-Payload([string]$Source, [string]$DestPath) {
 }
 
 function Get-RemoteLength([string]$Url) {
-    $headers = & curl.exe -sI -L --fail $Url
+    $headers = & curl.exe -sI -L --fail $Url 2>$null
     if ($LASTEXITCODE -ne 0) { return [int64]-1 }
     $length = [int64]-1
     foreach ($line in @($headers)) {
@@ -100,7 +100,15 @@ function Install-Asset($Item, [string]$Repo, [string]$Tag) {
     }
     $asset = [uri]::EscapeDataString([string]$Item.asset)
     $url = "https://github.com/$Repo/releases/download/$Tag/$asset"
+    if ($Item.optional -and (Get-RemoteLength $url) -lt 0) {
+        Write-Host "optionnel absent  $($Item.asset)"
+        return $true
+    }
     if (Save-Url $url $destPath) { return $true }
+    if ($Item.optional) {
+        Write-Host "optionnel absent  $($Item.asset)"
+        return $true
+    }
     Write-Host "introuvable  $($Item.asset)"
     return $false
 }
