@@ -1,4 +1,5 @@
 /target
 /gpustacker
 /siril
+/onnxruntime
 /dubNoise/*.wts

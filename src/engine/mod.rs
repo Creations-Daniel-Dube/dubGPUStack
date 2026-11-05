@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+pub mod aberration;
+pub mod bge;
 pub mod cache;
 pub mod denoise;
 pub mod export;

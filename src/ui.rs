@@ -665,7 +665,7 @@ impl App {
                     }
                     ui.close();
                 }
-                if ui.button("Empiler").on_hover_text("Empile les images sélectionnées. Écrit le FITS _postStack, puis _stretch, puis _DN si le débruitage est actif.").clicked() { self.start(false, false); ui.close(); }
+                if ui.button("Empiler").on_hover_text("Empile les images sélectionnées. Écrit le FITS _postStack, puis _stretch, _BGE, _AB, puis _DN si le débruitage est actif.").clicked() { self.start(false, false); ui.close(); }
                 if ui.button("Quitter").on_hover_text("Ferme dubGPUStack.").clicked() { ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close); }
             }).response.on_hover_text("Ouvrir, recharger ou quitter.");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -717,17 +717,17 @@ impl App {
                         ui.add(DragValue::new(&mut self.crop_h).range(0..=200000).prefix("h ")).on_hover_text("Hauteur du recadrage, en pixels.");
                     });
                 }
-                if ui.button("Choisir le fichier de sortie…").on_hover_text("Change le nom de base. Chaque enregistrement ajoute le suffixe de l'étape : _postStack, _stretch, _DN.").clicked() {
+                if ui.button("Choisir le fichier de sortie…").on_hover_text("Change le nom de base. Chaque enregistrement ajoute le suffixe de l'étape : _postStack, _stretch, _BGE, _AB, _DN.").clicked() {
                     self.ask_output_name();
                 }
                 let name_tip = if self.output_path.is_empty() {
-                    "Sans nom choisi, un nom automatique est créé à l'empilement. Les fichiers reçoivent _postStack, _stretch et, si le débruitage est actif, _DN."
+                    "Sans nom choisi, un nom automatique est créé à l'empilement. Les fichiers reçoivent _postStack, _stretch, _BGE, _AB et, si le débruitage est actif, _DN."
                 } else {
-                    "Nom de base, sans suffixe. L'empilement écrit ce nom avec _postStack, _stretch et, si le débruitage est actif, _DN."
+                    "Nom de base, sans suffixe. L'empilement écrit ce nom avec _postStack, _stretch, _BGE, _AB et, si le débruitage est actif, _DN."
                 };
                 ui.label(if self.output_path.is_empty() { "Nom automatique".to_string() } else { short_path(&self.output_path) }).on_hover_text(name_tip);
                 ui.checkbox(&mut self.settings.save_coverage, "Carte de couverture").on_hover_text("Écrit aussi la carte du nombre d'images par pixel, avec le suffixe _coverage.");
-                ui.checkbox(&mut self.settings.denoise, "Débruitage dubNoise").on_hover_text("Après le FITS _stretch, retire le bruit puis écrit le FITS _DN. Le FITS linéaire _postStack reste inchangé. Réglages figés : force 90 %, tuile 512, recouvrement 96.");
+                ui.checkbox(&mut self.settings.denoise, "Débruitage dubNoise").on_hover_text("Après le FITS _AB, retire le bruit puis écrit le FITS _DN. Les FITS _postStack, _stretch, _BGE et _AB restent inchangés. Réglages figés : force 90 %, tuile 512, recouvrement 96.");
             });
             advanced_toggle(ui, &mut self.advanced_open);
             if self.advanced_open {
@@ -778,7 +778,7 @@ impl App {
         if ui.add_enabled(!self.busy, egui::Button::new(RichText::new(test).size(16.0)).min_size(wide)).on_hover_text("Empile une bande de 192 lignes au plus couvert, sans écrire de fichier.").clicked() {
             self.start(false, true);
         }
-        if ui.add_enabled(!self.busy, egui::Button::new(RichText::new(stack).size(16.0)).min_size(wide)).on_hover_text("Empile les images sélectionnées. Écrit le FITS _postStack, puis _stretch, puis _DN si le débruitage est actif.").clicked() {
+        if ui.add_enabled(!self.busy, egui::Button::new(RichText::new(stack).size(16.0)).min_size(wide)).on_hover_text("Empile les images sélectionnées. Écrit le FITS _postStack, puis _stretch, _BGE, _AB, puis _DN si le débruitage est actif.").clicked() {
             self.start(false, false);
         }
         if self.busy {

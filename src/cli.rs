@@ -195,7 +195,7 @@ fn print_help() {
     println("  [--overwrite] [--gpu-mem-gib N] [--scale 1|1.5|2|3] [--pixfrac 0.05..1]");
     println("  [--transform affine|similarity] [--strip N] [--tile N] [--workers N] [--analyze-only] [--denoise]");
     println("  strip et tile à 0 choisissent la bande selon la mémoire libre");
-    println("  --out est le nom de base : les fichiers reçoivent _postStack, _stretch et _DN");
+    println("  --out est le nom de base : les fichiers reçoivent _postStack, _stretch, _BGE, _AB et _DN");
     println("Sans argument, ou avec un chemin, l'interface s'ouvre.");
 }
 

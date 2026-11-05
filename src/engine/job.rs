@@ -148,8 +148,11 @@ pub struct RunOutput {
 pub fn run(cfg: &JobConfig, cancel: &AtomicBool, mut emit: impl FnMut(Event)) -> Result<RunOutput, String> {
     let started = std::time::Instant::now();
     cfg.validate()?;
-    if cfg.denoise && cfg.rows.is_none() && !cfg.analyze_only {
-        crate::engine::denoise::require_weights()?;
+    if writes_products(cfg) {
+        crate::engine::aberration::require_model()?;
+        if cfg.denoise {
+            crate::engine::denoise::require_weights()?;
+        }
     }
     emit(Event::Progress { phase: "Démarrage".into(), done: 0.0, total: 1.0, detail: "GPU".into() });
     let gpu = Gpu::new().map_err(|err| format!("GPU indisponible : {err}"))?;
@@ -577,6 +580,23 @@ fn finish_stack(cfg: &JobConfig, gpu: &Gpu, budget: usize, free: usize, total: u
     emit(Event::Progress { phase: "Écriture FITS".into(), done: total_rows, total: total_rows, detail: stretch_path.display().to_string() });
     fits::write_fits(&stretch_path, &stretched.image, stacked.channels, stacked.height, stacked.width, &cards)?;
     emit(Event::Log { level: "ok".into(), message: format!("écrit {}", stretch_path.display()) });
+    emit(Event::Progress { phase: "Extraction de fond".into(), done: 0.0, total: 4.0, detail: stretch_path.display().to_string() });
+    crate::engine::bge::apply(&mut stretched.image, stacked.channels, stacked.height, stacked.width, cancel, |done, total| {
+        emit(Event::Progress { phase: "Extraction de fond".into(), done, total, detail: String::new() });
+    })?;
+    let bge_path = step_path(&base, "_BGE", &ext);
+    emit(Event::Progress { phase: "Écriture FITS".into(), done: total_rows, total: total_rows, detail: bge_path.display().to_string() });
+    fits::write_fits(&bge_path, &stretched.image, stacked.channels, stacked.height, stacked.width, &cards)?;
+    emit(Event::Log { level: "ok".into(), message: format!("écrit {}", bge_path.display()) });
+    emit(Event::Progress { phase: "Aberrations".into(), done: 0.0, total: 1.0, detail: "tuile 0".into() });
+    let aberrations = crate::engine::aberration::apply(&mut stretched.image, stacked.channels, stacked.height, stacked.width, cancel, |done, total| {
+        emit(Event::Progress { phase: "Aberrations".into(), done: done as f64, total: total as f64, detail: format!("tuile {done}/{total}") });
+    })?;
+    emit(Event::Log { level: "ok".into(), message: format!("aberrations {}, {} tuiles en {:.1} s", aberrations.device, aberrations.tiles, aberrations.seconds) });
+    let ab_path = step_path(&base, "_AB", &ext);
+    emit(Event::Progress { phase: "Écriture FITS".into(), done: total_rows, total: total_rows, detail: ab_path.display().to_string() });
+    fits::write_fits(&ab_path, &stretched.image, stacked.channels, stacked.height, stacked.width, &cards)?;
+    emit(Event::Log { level: "ok".into(), message: format!("écrit {}", ab_path.display()) });
     let display_suffix = if cfg.denoise {
         let tiles = crate::engine::denoise::tile_count_hint(stretched.image.len(), stacked.channels, stacked.height, stacked.width);
         emit(Event::Progress { phase: "Débruitage".into(), done: 0.0, total: tiles as f64, detail: format!("tuile 0/{tiles}") });
@@ -590,7 +610,7 @@ fn finish_stack(cfg: &JobConfig, gpu: &Gpu, budget: usize, free: usize, total: u
         emit(Event::Log { level: "ok".into(), message: format!("écrit {}", dn_path.display()) });
         "_DN"
     } else {
-        "_stretch"
+        "_AB"
     };
     let [png8, png16, tiff] = display_paths(&base, display_suffix);
     export::write_png(&png8, &stretched.image, stacked.channels, stacked.height, stacked.width, false)?;
@@ -602,9 +622,11 @@ fn finish_stack(cfg: &JobConfig, gpu: &Gpu, budget: usize, free: usize, total: u
     emit(Event::Log {
         level: "ok".into(),
         message: format!(
-            "HyperMetric Log D = {:.2} · {} · {} · {} · {}",
+            "HyperMetric Log D = {:.2} · {} · {} · {} · {} · {} · {}",
             stretched.log_d,
             stretch_path.display(),
+            bge_path.display(),
+            ab_path.display(),
             png8.display(),
             png16.display(),
             tiff.display()
@@ -634,10 +656,14 @@ fn display_paths(base: &Path, suffix: &str) -> [PathBuf; 3] {
     ]
 }
 
+fn writes_products(cfg: &JobConfig) -> bool {
+    !cfg.analyze_only && !(cfg.rows.is_some() && cfg.output_path.is_empty())
+}
+
 pub fn planned_outputs(base: &Path, denoise: bool, coverage: bool) -> Vec<PathBuf> {
     let ext = fits_extension(base);
-    let mut paths = vec![step_path(base, "_postStack", &ext), step_path(base, "_stretch", &ext)];
-    let shown = if denoise { "_DN" } else { "_stretch" };
+    let mut paths = vec![step_path(base, "_postStack", &ext), step_path(base, "_stretch", &ext), step_path(base, "_BGE", &ext), step_path(base, "_AB", &ext)];
+    let shown = if denoise { "_DN" } else { "_AB" };
     if denoise {
         paths.push(step_path(base, "_DN", &ext));
     }
@@ -960,8 +986,13 @@ mod tests {
         let names: Vec<_> = planned_outputs(&base, true, true).iter().map(|path| path.file_name().unwrap().to_string_lossy().into_owned()).collect();
         assert!(names.contains(&"M42_postStack.fits".to_string()));
         assert!(names.contains(&"M42_stretch.fits".to_string()));
+        assert!(names.contains(&"M42_BGE.fits".to_string()));
+        assert!(names.contains(&"M42_AB.fits".to_string()));
         assert!(names.contains(&"M42_DN.fits".to_string()));
         assert!(names.contains(&"M42_DN.tiff".to_string()));
         assert!(names.contains(&"M42_coverage.fits".to_string()));
+        let plain: Vec<_> = planned_outputs(&base, false, false).iter().map(|path| path.file_name().unwrap().to_string_lossy().into_owned()).collect();
+        assert!(plain.contains(&"M42_AB.png".to_string()));
+        assert!(!plain.iter().any(|name| name.contains("_DN")));
     }
 }
