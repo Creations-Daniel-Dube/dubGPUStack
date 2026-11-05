@@ -130,7 +130,7 @@ fn runtime_library_names() -> &'static [&'static str] {
     }
 }
 
-fn require_runtime() -> Result<PathBuf, String> {
+pub(crate) fn require_runtime() -> Result<PathBuf, String> {
     for candidate in runtime_candidates() {
         if candidate.is_file() {
             return Ok(candidate);
@@ -146,6 +146,7 @@ fn require_runtime() -> Result<PathBuf, String> {
 
 fn runtime_candidates() -> Vec<PathBuf> {
     let mut candidates = Vec::new();
+    push_runtime(&mut candidates, &crate::runtime::install_dir());
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
             for name in runtime_library_names() {
@@ -156,6 +157,12 @@ fn runtime_candidates() -> Vec<PathBuf> {
     }
     if let Ok(cwd) = std::env::current_dir() {
         push_runtime(&mut candidates, &cwd);
+    }
+    let home = crate::runtime::home();
+    for name in runtime_library_names() {
+        candidates.push(home.join(name));
+        candidates.push(home.join("onnxruntime").join(name));
+        candidates.push(home.join("onnxruntime").join("lib").join(name));
     }
     candidates
 }
@@ -455,6 +462,9 @@ fn mad_of(values: &[f32], median: f64) -> f64 {
 
 fn model_candidates() -> Vec<PathBuf> {
     let mut candidates = Vec::new();
+    let installed = crate::runtime::install_dir();
+    candidates.push(installed.join(MODEL_NAME));
+    candidates.push(installed.join("siril").join(MODEL_NAME));
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
             candidates.push(dir.join(MODEL_NAME));
@@ -464,6 +474,9 @@ fn model_candidates() -> Vec<PathBuf> {
     if let Ok(cwd) = std::env::current_dir() {
         push_project_model(&mut candidates, &cwd);
     }
+    let home = crate::runtime::home();
+    candidates.push(home.join(MODEL_NAME));
+    candidates.push(home.join("siril").join(MODEL_NAME));
     candidates
 }
 

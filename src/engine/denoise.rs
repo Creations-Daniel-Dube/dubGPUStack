@@ -144,6 +144,9 @@ fn weights_path() -> Result<PathBuf, String> {
 
 fn weight_candidates() -> Vec<PathBuf> {
     let mut candidates = Vec::new();
+    let installed = crate::runtime::install_dir();
+    candidates.push(installed.join("dub_noise_rd.wts"));
+    candidates.push(installed.join("dubNoise").join("dub_noise_rd.wts"));
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
             candidates.push(dir.join("dub_noise_rd.wts"));
@@ -153,6 +156,9 @@ fn weight_candidates() -> Vec<PathBuf> {
     if let Ok(cwd) = std::env::current_dir() {
         push_project_weights(&mut candidates, &cwd);
     }
+    let home = crate::runtime::home();
+    candidates.push(home.join("dub_noise_rd.wts"));
+    candidates.push(home.join("dubNoise").join("dub_noise_rd.wts"));
     candidates
 }
 

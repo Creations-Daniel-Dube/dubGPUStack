@@ -17,6 +17,7 @@ use crate::engine::sequence;
 use crate::engine::stretch;
 use crate::gpu;
 use crate::icon::app_icon;
+use crate::runtime::{self, Update};
 use crate::settings::Settings;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -110,6 +111,10 @@ pub struct App {
     crop_ui: Option<CropUi>,
     advanced_open: bool,
     open_at_start: Option<String>,
+    runtime_rx: Option<Receiver<Update>>,
+    runtime_fraction: f32,
+    runtime_label: String,
+    runtime_error: Option<String>,
 }
 
 impl App {
@@ -146,7 +151,15 @@ impl App {
             crop_ui: None,
             advanced_open: false,
             open_at_start: open,
+            runtime_rx: None,
+            runtime_fraction: 0.0,
+            runtime_label: "Préparation des fichiers requis…".to_string(),
+            runtime_error: None,
         };
+        runtime::enable_dll_search();
+        if !runtime::ready() {
+            app.runtime_rx = Some(runtime::Fetch::spawn().rx);
+        }
         match gpu::probe_gpu() {
             Ok(info) => app.gpu_line = info.summary(),
             Err(err) => {
@@ -1043,8 +1056,74 @@ impl App {
     }
 }
 
+impl App {
+    fn runtime_gate(&mut self, ui: &mut egui::Ui) -> bool {
+        let mut disconnected = false;
+        let updates: Vec<Update> = self.runtime_rx.as_ref().map(|rx| {
+            let mut items = Vec::new();
+            loop {
+                match rx.try_recv() {
+                    Ok(update) => items.push(update),
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        break;
+                    }
+                }
+            }
+            items
+        }).unwrap_or_default();
+        if disconnected && !updates.iter().any(|update| matches!(update, Update::Finished(_))) {
+            self.runtime_error = Some("Téléchargement interrompu.".to_string());
+            self.runtime_rx = None;
+        }
+        for update in updates {
+            match update {
+                Update::Progress { fraction, label } => {
+                    self.runtime_fraction = fraction;
+                    self.runtime_label = label;
+                }
+                Update::Finished(Ok(())) => {
+                    runtime::enable_dll_search();
+                    self.runtime_rx = None;
+                    self.runtime_error = None;
+                    return false;
+                }
+                Update::Finished(Err(err)) => {
+                    self.runtime_error = Some(err);
+                    self.runtime_rx = None;
+                }
+            }
+        }
+        if self.runtime_rx.is_none() && self.runtime_error.is_none() {
+            return false;
+        }
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(80));
+        egui::CentralPanel::default().show(ui, |ui| {
+            ui.vertical_centered(|ui| {
+                ui.add_space(80.0);
+                ui.label(RichText::new("Fichiers requis").size(22.0).strong());
+                ui.add_space(12.0);
+                ui.label(&self.runtime_label);
+                ui.add_space(8.0);
+                if self.runtime_error.is_none() {
+                    ui.add(egui::ProgressBar::new(self.runtime_fraction.clamp(0.0, 1.0)).animate(self.runtime_fraction <= 0.0).desired_width(420.0));
+                }
+                if let Some(err) = &self.runtime_error {
+                    ui.add_space(12.0);
+                    ui.colored_label(Color32::from_rgb(0xff, 0x55, 0x44), err);
+                }
+            });
+        });
+        true
+    }
+}
+
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        if self.runtime_gate(ui) {
+            return;
+        }
         let ctx = ui.ctx().clone();
         self.poll(&ctx);
         egui::Panel::top("menu").show(ui, |ui| self.ui_bar(ui));
