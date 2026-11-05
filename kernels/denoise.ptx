@@ -1,0 +1,1145 @@
+.version 7.0
+.target sm_61
+.address_size 64
+
+// NAFNet mini, fp32. Tile GEMM 64x64 for 1x1 convolutions.
+.visible .entry conv1x1(
+    .param .u64 p_in,
+    .param .u64 p_w,
+    .param .u64 p_bias,
+    .param .u64 p_out,
+    .param .u32 p_cin,
+    .param .u32 p_cout,
+    .param .u32 p_spatial
+)
+{
+    .reg .pred %p;
+    .reg .u32 %tx, %ty, %lin, %cta, %m0, %n0, %k0, %iter, %e, %row, %col;
+    .reg .u32 %gm, %gk, %gn, %kk, %row0, %col0, %ai, %bi, %cin, %cout, %spatial;
+    .reg .u64 %in, %w, %bias, %out, %as, %bs, %asg, %bsg, %addr, %off;
+    .reg .f32 %val, %a0, %a1, %a2, %a3, %b0, %b1, %b2, %b3, %biasv;
+    .reg .f32 %c00, %c01, %c02, %c03, %c10, %c11, %c12, %c13;
+    .reg .f32 %c20, %c21, %c22, %c23, %c30, %c31, %c32, %c33;
+    .shared .align 16 .f32 As[1024];
+    .shared .align 16 .f32 Bs[1024];
+
+    ld.param.u64 %in, [p_in];
+    ld.param.u64 %w, [p_w];
+    ld.param.u64 %bias, [p_bias];
+    ld.param.u64 %out, [p_out];
+    ld.param.u32 %cin, [p_cin];
+    ld.param.u32 %cout, [p_cout];
+    ld.param.u32 %spatial, [p_spatial];
+    mov.u32 %tx, %tid.x;
+    mov.u32 %ty, %tid.y;
+    mad.lo.u32 %lin, %ty, 16, %tx;
+    mov.u32 %cta, %ctaid.y;
+    shl.b32 %m0, %cta, 6;
+    mov.u32 %cta, %ctaid.x;
+    shl.b32 %n0, %cta, 6;
+    mov.u64 %as, As;
+    mov.u64 %bs, Bs;
+    mov.f32 %c00, 0f00000000;
+    mov.f32 %c01, 0f00000000;
+    mov.f32 %c02, 0f00000000;
+    mov.f32 %c03, 0f00000000;
+    mov.f32 %c10, 0f00000000;
+    mov.f32 %c11, 0f00000000;
+    mov.f32 %c12, 0f00000000;
+    mov.f32 %c13, 0f00000000;
+    mov.f32 %c20, 0f00000000;
+    mov.f32 %c21, 0f00000000;
+    mov.f32 %c22, 0f00000000;
+    mov.f32 %c23, 0f00000000;
+    mov.f32 %c30, 0f00000000;
+    mov.f32 %c31, 0f00000000;
+    mov.f32 %c32, 0f00000000;
+    mov.f32 %c33, 0f00000000;
+    mov.u32 %k0, 0;
+
+kloop:
+    setp.ge.u32 %p, %k0, %cin;
+    @%p bra kdone;
+    mov.u32 %iter, 0;
+aload:
+    setp.ge.u32 %p, %iter, 4;
+    @%p bra aload_done;
+    mad.lo.u32 %e, %iter, 256, %lin;
+    shr.u32 %row, %e, 4;
+    and.b32 %col, %e, 15;
+    add.u32 %gm, %m0, %row;
+    add.u32 %gk, %k0, %col;
+    mov.f32 %val, 0f00000000;
+    setp.ge.u32 %p, %gm, %cout;
+    setp.ge.or.u32 %p, %gk, %cin, %p;
+    @%p bra astore;
+    mul.wide.u32 %off, %gm, %cin;
+    cvt.u64.u32 %addr, %gk;
+    add.u64 %off, %off, %addr;
+    shl.b64 %off, %off, 2;
+    add.u64 %addr, %w, %off;
+    ld.global.f32 %val, [%addr];
+astore:
+    mul.wide.u32 %off, %e, 4;
+    add.u64 %addr, %as, %off;
+    st.shared.f32 [%addr], %val;
+    shr.u32 %row, %e, 6;
+    and.b32 %col, %e, 63;
+    add.u32 %gk, %k0, %row;
+    add.u32 %gn, %n0, %col;
+    mov.f32 %val, 0f00000000;
+    setp.ge.u32 %p, %gk, %cin;
+    setp.ge.or.u32 %p, %gn, %spatial, %p;
+    @%p bra bstore;
+    mul.wide.u32 %off, %gk, %spatial;
+    cvt.u64.u32 %addr, %gn;
+    add.u64 %off, %off, %addr;
+    shl.b64 %off, %off, 2;
+    add.u64 %addr, %in, %off;
+    ld.global.f32 %val, [%addr];
+bstore:
+    mul.wide.u32 %off, %e, 4;
+    add.u64 %addr, %bs, %off;
+    st.shared.f32 [%addr], %val;
+    add.u32 %iter, %iter, 1;
+    bra aload;
+aload_done:
+    bar.sync 0;
+    shl.b32 %row0, %ty, 2;
+    shl.b32 %col0, %tx, 2;
+    mov.u32 %kk, 0;
+floop:
+    setp.ge.u32 %p, %kk, 16;
+    @%p bra fdone;
+    mad.lo.u32 %ai, %row0, 16, %kk;
+    mul.wide.u32 %off, %ai, 4;
+    add.u64 %addr, %as, %off;
+    ld.shared.f32 %a0, [%addr];
+    add.u32 %ai, %ai, 16;
+    mul.wide.u32 %off, %ai, 4;
+    add.u64 %addr, %as, %off;
+    ld.shared.f32 %a1, [%addr];
+    add.u32 %ai, %ai, 16;
+    mul.wide.u32 %off, %ai, 4;
+    add.u64 %addr, %as, %off;
+    ld.shared.f32 %a2, [%addr];
+    add.u32 %ai, %ai, 16;
+    mul.wide.u32 %off, %ai, 4;
+    add.u64 %addr, %as, %off;
+    ld.shared.f32 %a3, [%addr];
+    mad.lo.u32 %bi, %kk, 64, %col0;
+    mul.wide.u32 %off, %bi, 4;
+    add.u64 %addr, %bs, %off;
+    ld.shared.f32 %b0, [%addr];
+    add.u32 %bi, %bi, 1;
+    mul.wide.u32 %off, %bi, 4;
+    add.u64 %addr, %bs, %off;
+    ld.shared.f32 %b1, [%addr];
+    add.u32 %bi, %bi, 1;
+    mul.wide.u32 %off, %bi, 4;
+    add.u64 %addr, %bs, %off;
+    ld.shared.f32 %b2, [%addr];
+    add.u32 %bi, %bi, 1;
+    mul.wide.u32 %off, %bi, 4;
+    add.u64 %addr, %bs, %off;
+    ld.shared.f32 %b3, [%addr];
+    fma.rn.f32 %c00, %a0, %b0, %c00;
+    fma.rn.f32 %c01, %a0, %b1, %c01;
+    fma.rn.f32 %c02, %a0, %b2, %c02;
+    fma.rn.f32 %c03, %a0, %b3, %c03;
+    fma.rn.f32 %c10, %a1, %b0, %c10;
+    fma.rn.f32 %c11, %a1, %b1, %c11;
+    fma.rn.f32 %c12, %a1, %b2, %c12;
+    fma.rn.f32 %c13, %a1, %b3, %c13;
+    fma.rn.f32 %c20, %a2, %b0, %c20;
+    fma.rn.f32 %c21, %a2, %b1, %c21;
+    fma.rn.f32 %c22, %a2, %b2, %c22;
+    fma.rn.f32 %c23, %a2, %b3, %c23;
+    fma.rn.f32 %c30, %a3, %b0, %c30;
+    fma.rn.f32 %c31, %a3, %b1, %c31;
+    fma.rn.f32 %c32, %a3, %b2, %c32;
+    fma.rn.f32 %c33, %a3, %b3, %c33;
+    add.u32 %kk, %kk, 1;
+    bra floop;
+fdone:
+    bar.sync 0;
+    add.u32 %k0, %k0, 16;
+    bra kloop;
+kdone:
+    shl.b32 %row0, %ty, 2;
+    shl.b32 %col0, %tx, 2;
+    add.u32 %gm, %m0, %row0;
+    add.u32 %gn, %n0, %col0;
+    setp.ge.u32 %p, %gm, %cout;
+    setp.ge.or.u32 %p, %gn, %spatial, %p;
+    @%p bra s01;
+    mul.wide.u32 %off, %gm, 4;
+    add.u64 %addr, %bias, %off;
+    ld.global.f32 %biasv, [%addr];
+    add.f32 %c00, %c00, %biasv;
+    add.f32 %c01, %c01, %biasv;
+    add.f32 %c02, %c02, %biasv;
+    add.f32 %c03, %c03, %biasv;
+    mul.wide.u32 %off, %gm, %spatial;
+    cvt.u64.u32 %addr, %gn;
+    add.u64 %off, %off, %addr;
+    shl.b64 %off, %off, 2;
+    add.u64 %addr, %out, %off;
+    st.global.f32 [%addr], %c00;
+    add.u32 %gn, %gn, 1;
+    setp.ge.u32 %p, %gn, %spatial;
+    @%p bra s01;
+    add.u64 %addr, %addr, 4;
+    st.global.f32 [%addr], %c01;
+    add.u32 %gn, %gn, 1;
+    setp.ge.u32 %p, %gn, %spatial;
+    @%p bra s01;
+    add.u64 %addr, %addr, 4;
+    st.global.f32 [%addr], %c02;
+    add.u32 %gn, %gn, 1;
+    setp.ge.u32 %p, %gn, %spatial;
+    @%p bra s01;
+    add.u64 %addr, %addr, 4;
+    st.global.f32 [%addr], %c03;
+s01:
+    add.u32 %gm, %gm, 1;
+    add.u32 %gn, %n0, %col0;
+    setp.ge.u32 %p, %gm, %cout;
+    setp.ge.or.u32 %p, %gn, %spatial, %p;
+    @%p bra s02;
+    mul.wide.u32 %off, %gm, 4;
+    add.u64 %addr, %bias, %off;
+    ld.global.f32 %biasv, [%addr];
+    add.f32 %c10, %c10, %biasv;
+    add.f32 %c11, %c11, %biasv;
+    add.f32 %c12, %c12, %biasv;
+    add.f32 %c13, %c13, %biasv;
+    mul.wide.u32 %off, %gm, %spatial;
+    cvt.u64.u32 %addr, %gn;
+    add.u64 %off, %off, %addr;
+    shl.b64 %off, %off, 2;
+    add.u64 %addr, %out, %off;
+    st.global.f32 [%addr], %c10;
+    add.u32 %gn, %gn, 1;
+    setp.ge.u32 %p, %gn, %spatial;
+    @%p bra s02;
+    add.u64 %addr, %addr, 4;
+    st.global.f32 [%addr], %c11;
+    add.u32 %gn, %gn, 1;
+    setp.ge.u32 %p, %gn, %spatial;
+    @%p bra s02;
+    add.u64 %addr, %addr, 4;
+    st.global.f32 [%addr], %c12;
+    add.u32 %gn, %gn, 1;
+    setp.ge.u32 %p, %gn, %spatial;
+    @%p bra s02;
+    add.u64 %addr, %addr, 4;
+    st.global.f32 [%addr], %c13;
+s02:
+    add.u32 %gm, %gm, 1;
+    add.u32 %gn, %n0, %col0;
+    setp.ge.u32 %p, %gm, %cout;
+    setp.ge.or.u32 %p, %gn, %spatial, %p;
+    @%p bra s03;
+    mul.wide.u32 %off, %gm, 4;
+    add.u64 %addr, %bias, %off;
+    ld.global.f32 %biasv, [%addr];
+    add.f32 %c20, %c20, %biasv;
+    add.f32 %c21, %c21, %biasv;
+    add.f32 %c22, %c22, %biasv;
+    add.f32 %c23, %c23, %biasv;
+    mul.wide.u32 %off, %gm, %spatial;
+    cvt.u64.u32 %addr, %gn;
+    add.u64 %off, %off, %addr;
+    shl.b64 %off, %off, 2;
+    add.u64 %addr, %out, %off;
+    st.global.f32 [%addr], %c20;
+    add.u32 %gn, %gn, 1;
+    setp.ge.u32 %p, %gn, %spatial;
+    @%p bra s03;
+    add.u64 %addr, %addr, 4;
+    st.global.f32 [%addr], %c21;
+    add.u32 %gn, %gn, 1;
+    setp.ge.u32 %p, %gn, %spatial;
+    @%p bra s03;
+    add.u64 %addr, %addr, 4;
+    st.global.f32 [%addr], %c22;
+    add.u32 %gn, %gn, 1;
+    setp.ge.u32 %p, %gn, %spatial;
+    @%p bra s03;
+    add.u64 %addr, %addr, 4;
+    st.global.f32 [%addr], %c23;
+s03:
+    add.u32 %gm, %gm, 1;
+    add.u32 %gn, %n0, %col0;
+    setp.ge.u32 %p, %gm, %cout;
+    setp.ge.or.u32 %p, %gn, %spatial, %p;
+    @%p bra sdone;
+    mul.wide.u32 %off, %gm, 4;
+    add.u64 %addr, %bias, %off;
+    ld.global.f32 %biasv, [%addr];
+    add.f32 %c30, %c30, %biasv;
+    add.f32 %c31, %c31, %biasv;
+    add.f32 %c32, %c32, %biasv;
+    add.f32 %c33, %c33, %biasv;
+    mul.wide.u32 %off, %gm, %spatial;
+    cvt.u64.u32 %addr, %gn;
+    add.u64 %off, %off, %addr;
+    shl.b64 %off, %off, 2;
+    add.u64 %addr, %out, %off;
+    st.global.f32 [%addr], %c30;
+    add.u32 %gn, %gn, 1;
+    setp.ge.u32 %p, %gn, %spatial;
+    @%p bra sdone;
+    add.u64 %addr, %addr, 4;
+    st.global.f32 [%addr], %c31;
+    add.u32 %gn, %gn, 1;
+    setp.ge.u32 %p, %gn, %spatial;
+    @%p bra sdone;
+    add.u64 %addr, %addr, 4;
+    st.global.f32 [%addr], %c32;
+    add.u32 %gn, %gn, 1;
+    setp.ge.u32 %p, %gn, %spatial;
+    @%p bra sdone;
+    add.u64 %addr, %addr, 4;
+    st.global.f32 [%addr], %c33;
+sdone:
+    ret;
+}
+
+.visible .entry dwconv3(
+    .param .u64 p_in,
+    .param .u64 p_w,
+    .param .u64 p_bias,
+    .param .u64 p_out,
+    .param .u32 p_c,
+    .param .u32 p_h,
+    .param .u32 p_width
+)
+{
+    .reg .pred %p, %q;
+    .reg .u32 %gid, %n, %c, %h, %w, %spatial, %s, %y, %x, %oc, %ky, %kx, %cta, %nt;
+    .reg .s32 %iy, %ix, %sy, %sx, %sh, %sw;
+    .reg .u64 %in, %wt, %bias, %out, %addr, %off;
+    .reg .f32 %acc, %pix, %kv;
+    ld.param.u64 %in, [p_in];
+    ld.param.u64 %wt, [p_w];
+    ld.param.u64 %bias, [p_bias];
+    ld.param.u64 %out, [p_out];
+    ld.param.u32 %c, [p_c];
+    ld.param.u32 %h, [p_h];
+    ld.param.u32 %w, [p_width];
+    mov.u32 %gid, %tid.x;
+    mov.u32 %cta, %ctaid.x;
+    mov.u32 %nt, %ntid.x;
+    mad.lo.u32 %gid, %cta, %nt, %gid;
+    mul.lo.u32 %spatial, %h, %w;
+    mul.lo.u32 %n, %c, %spatial;
+    setp.ge.u32 %p, %gid, %n;
+    @%p ret;
+    div.u32 %oc, %gid, %spatial;
+    rem.u32 %s, %gid, %spatial;
+    div.u32 %y, %s, %w;
+    rem.u32 %x, %s, %w;
+    mul.wide.u32 %off, %oc, 4;
+    add.u64 %addr, %bias, %off;
+    ld.global.f32 %acc, [%addr];
+    cvt.s32.u32 %sy, %y;
+    cvt.s32.u32 %sx, %x;
+    cvt.s32.u32 %sh, %h;
+    cvt.s32.u32 %sw, %w;
+    mov.u32 %ky, 0;
+ky:
+    setp.ge.u32 %p, %ky, 3;
+    @%p bra kydone;
+    mov.u32 %kx, 0;
+kx:
+    setp.ge.u32 %p, %kx, 3;
+    @%p bra kxdone;
+    cvt.s32.u32 %iy, %ky;
+    add.s32 %iy, %sy, %iy;
+    sub.s32 %iy, %iy, 1;
+    cvt.s32.u32 %ix, %kx;
+    add.s32 %ix, %sx, %ix;
+    sub.s32 %ix, %ix, 1;
+    mov.f32 %pix, 0f00000000;
+    setp.lt.s32 %q, %iy, 0;
+    setp.ge.or.s32 %q, %iy, %sh, %q;
+    setp.lt.or.s32 %q, %ix, 0, %q;
+    setp.ge.or.s32 %q, %ix, %sw, %q;
+    @%q bra kskip;
+    cvt.u32.s32 %y, %iy;
+    cvt.u32.s32 %x, %ix;
+    mad.lo.u32 %s, %oc, %h, %y;
+    mad.lo.u32 %s, %s, %w, %x;
+    mul.wide.u32 %off, %s, 4;
+    add.u64 %addr, %in, %off;
+    ld.global.f32 %pix, [%addr];
+kskip:
+    mad.lo.u32 %s, %ky, 3, %kx;
+    mad.lo.u32 %s, %oc, 9, %s;
+    mul.wide.u32 %off, %s, 4;
+    add.u64 %addr, %wt, %off;
+    ld.global.f32 %kv, [%addr];
+    fma.rn.f32 %acc, %pix, %kv, %acc;
+    add.u32 %kx, %kx, 1;
+    bra kx;
+kxdone:
+    add.u32 %ky, %ky, 1;
+    bra ky;
+kydone:
+    mul.wide.u32 %off, %gid, 4;
+    add.u64 %addr, %out, %off;
+    st.global.f32 [%addr], %acc;
+    ret;
+}
+
+.visible .entry conv3x3(
+    .param .u64 p_in,
+    .param .u64 p_w,
+    .param .u64 p_bias,
+    .param .u64 p_out,
+    .param .u32 p_cin,
+    .param .u32 p_cout,
+    .param .u32 p_h,
+    .param .u32 p_width
+)
+{
+    .reg .pred %p, %q;
+    .reg .u32 %gid, %n, %cin, %cout, %h, %w, %spatial, %s, %y, %x, %oc, %ic, %ky, %kx, %cta, %nt;
+    .reg .s32 %iy, %ix, %sy, %sx, %sh, %sw;
+    .reg .u64 %in, %wt, %bias, %out, %addr, %off;
+    .reg .f32 %acc, %pix, %kv;
+    ld.param.u64 %in, [p_in];
+    ld.param.u64 %wt, [p_w];
+    ld.param.u64 %bias, [p_bias];
+    ld.param.u64 %out, [p_out];
+    ld.param.u32 %cin, [p_cin];
+    ld.param.u32 %cout, [p_cout];
+    ld.param.u32 %h, [p_h];
+    ld.param.u32 %w, [p_width];
+    mov.u32 %gid, %tid.x;
+    mov.u32 %cta, %ctaid.x;
+    mov.u32 %nt, %ntid.x;
+    mad.lo.u32 %gid, %cta, %nt, %gid;
+    mul.lo.u32 %spatial, %h, %w;
+    mul.lo.u32 %n, %cout, %spatial;
+    setp.ge.u32 %p, %gid, %n;
+    @%p ret;
+    div.u32 %oc, %gid, %spatial;
+    rem.u32 %s, %gid, %spatial;
+    div.u32 %y, %s, %w;
+    rem.u32 %x, %s, %w;
+    mul.wide.u32 %off, %oc, 4;
+    add.u64 %addr, %bias, %off;
+    ld.global.f32 %acc, [%addr];
+    cvt.s32.u32 %sy, %y;
+    cvt.s32.u32 %sx, %x;
+    cvt.s32.u32 %sh, %h;
+    cvt.s32.u32 %sw, %w;
+    mov.u32 %ic, 0;
+icloop:
+    setp.ge.u32 %p, %ic, %cin;
+    @%p bra icdone;
+    mov.u32 %ky, 0;
+ky:
+    setp.ge.u32 %p, %ky, 3;
+    @%p bra kydone;
+    mov.u32 %kx, 0;
+kx:
+    setp.ge.u32 %p, %kx, 3;
+    @%p bra kxdone;
+    cvt.s32.u32 %iy, %ky;
+    add.s32 %iy, %sy, %iy;
+    sub.s32 %iy, %iy, 1;
+    cvt.s32.u32 %ix, %kx;
+    add.s32 %ix, %sx, %ix;
+    sub.s32 %ix, %ix, 1;
+    mov.f32 %pix, 0f00000000;
+    setp.lt.s32 %q, %iy, 0;
+    setp.ge.or.s32 %q, %iy, %sh, %q;
+    setp.lt.or.s32 %q, %ix, 0, %q;
+    setp.ge.or.s32 %q, %ix, %sw, %q;
+    @%q bra kskip;
+    cvt.u32.s32 %y, %iy;
+    cvt.u32.s32 %x, %ix;
+    mad.lo.u32 %s, %ic, %h, %y;
+    mad.lo.u32 %s, %s, %w, %x;
+    mul.wide.u32 %off, %s, 4;
+    add.u64 %addr, %in, %off;
+    ld.global.f32 %pix, [%addr];
+kskip:
+    mad.lo.u32 %s, %oc, %cin, %ic;
+    mad.lo.u32 %s, %s, 3, %ky;
+    mad.lo.u32 %s, %s, 3, %kx;
+    mul.wide.u32 %off, %s, 4;
+    add.u64 %addr, %wt, %off;
+    ld.global.f32 %kv, [%addr];
+    fma.rn.f32 %acc, %pix, %kv, %acc;
+    add.u32 %kx, %kx, 1;
+    bra kx;
+kxdone:
+    add.u32 %ky, %ky, 1;
+    bra ky;
+kydone:
+    add.u32 %ic, %ic, 1;
+    bra icloop;
+icdone:
+    mul.wide.u32 %off, %gid, 4;
+    add.u64 %addr, %out, %off;
+    st.global.f32 [%addr], %acc;
+    ret;
+}
+
+.visible .entry conv_k2s2(
+    .param .u64 p_in,
+    .param .u64 p_w,
+    .param .u64 p_bias,
+    .param .u64 p_out,
+    .param .u32 p_cin,
+    .param .u32 p_cout,
+    .param .u32 p_h,
+    .param .u32 p_width
+)
+{
+    .reg .pred %p;
+    .reg .u32 %gid, %n, %cin, %cout, %h, %w, %oh, %ow, %spatial, %s, %y, %x, %oc, %ic, %ky, %kx, %iy, %ix, %cta, %nt;
+    .reg .u64 %in, %wt, %bias, %out, %addr, %off;
+    .reg .f32 %acc, %pix, %kv;
+    ld.param.u64 %in, [p_in];
+    ld.param.u64 %wt, [p_w];
+    ld.param.u64 %bias, [p_bias];
+    ld.param.u64 %out, [p_out];
+    ld.param.u32 %cin, [p_cin];
+    ld.param.u32 %cout, [p_cout];
+    ld.param.u32 %h, [p_h];
+    ld.param.u32 %w, [p_width];
+    mov.u32 %gid, %tid.x;
+    mov.u32 %cta, %ctaid.x;
+    mov.u32 %nt, %ntid.x;
+    mad.lo.u32 %gid, %cta, %nt, %gid;
+    shr.u32 %oh, %h, 1;
+    shr.u32 %ow, %w, 1;
+    mul.lo.u32 %spatial, %oh, %ow;
+    mul.lo.u32 %n, %cout, %spatial;
+    setp.ge.u32 %p, %gid, %n;
+    @%p ret;
+    div.u32 %oc, %gid, %spatial;
+    rem.u32 %s, %gid, %spatial;
+    div.u32 %y, %s, %ow;
+    rem.u32 %x, %s, %ow;
+    mul.wide.u32 %off, %oc, 4;
+    add.u64 %addr, %bias, %off;
+    ld.global.f32 %acc, [%addr];
+    mov.u32 %ic, 0;
+icloop:
+    setp.ge.u32 %p, %ic, %cin;
+    @%p bra icdone;
+    mov.u32 %ky, 0;
+ky:
+    setp.ge.u32 %p, %ky, 2;
+    @%p bra kydone;
+    mov.u32 %kx, 0;
+kx:
+    setp.ge.u32 %p, %kx, 2;
+    @%p bra kxdone;
+    shl.b32 %iy, %y, 1;
+    add.u32 %iy, %iy, %ky;
+    shl.b32 %ix, %x, 1;
+    add.u32 %ix, %ix, %kx;
+    mad.lo.u32 %s, %ic, %h, %iy;
+    mad.lo.u32 %s, %s, %w, %ix;
+    mul.wide.u32 %off, %s, 4;
+    add.u64 %addr, %in, %off;
+    ld.global.f32 %pix, [%addr];
+    mad.lo.u32 %s, %oc, %cin, %ic;
+    mad.lo.u32 %s, %s, 2, %ky;
+    mad.lo.u32 %s, %s, 2, %kx;
+    mul.wide.u32 %off, %s, 4;
+    add.u64 %addr, %wt, %off;
+    ld.global.f32 %kv, [%addr];
+    fma.rn.f32 %acc, %pix, %kv, %acc;
+    add.u32 %kx, %kx, 1;
+    bra kx;
+kxdone:
+    add.u32 %ky, %ky, 1;
+    bra ky;
+kydone:
+    add.u32 %ic, %ic, 1;
+    bra icloop;
+icdone:
+    mul.wide.u32 %off, %gid, 4;
+    add.u64 %addr, %out, %off;
+    st.global.f32 [%addr], %acc;
+    ret;
+}
+
+.visible .entry layernorm(
+    .param .u64 p_in,
+    .param .u64 p_out,
+    .param .u64 p_w,
+    .param .u64 p_bias,
+    .param .u32 p_c,
+    .param .u32 p_spatial,
+    .param .f32 p_eps
+)
+{
+    .reg .pred %p;
+    .reg .u32 %s, %c, %channels, %spatial, %i, %cta, %nt;
+    .reg .u64 %in, %out, %wt, %bias, %addr, %off;
+    .reg .f32 %sum, %mean, %var, %d, %inv, %eps, %scale, %shift, %val, %count;
+    ld.param.u64 %in, [p_in];
+    ld.param.u64 %out, [p_out];
+    ld.param.u64 %wt, [p_w];
+    ld.param.u64 %bias, [p_bias];
+    ld.param.u32 %channels, [p_c];
+    ld.param.u32 %spatial, [p_spatial];
+    ld.param.f32 %eps, [p_eps];
+    mov.u32 %s, %tid.x;
+    mov.u32 %cta, %ctaid.x;
+    mov.u32 %nt, %ntid.x;
+    mad.lo.u32 %s, %cta, %nt, %s;
+    setp.ge.u32 %p, %s, %spatial;
+    @%p ret;
+    mov.f32 %sum, 0f00000000;
+    mov.u32 %c, 0;
+sloop:
+    setp.ge.u32 %p, %c, %channels;
+    @%p bra sdone;
+    mul.wide.u32 %off, %c, %spatial;
+    cvt.u64.u32 %addr, %s;
+    add.u64 %off, %off, %addr;
+    shl.b64 %off, %off, 2;
+    add.u64 %addr, %in, %off;
+    ld.global.f32 %val, [%addr];
+    add.f32 %sum, %sum, %val;
+    add.u32 %c, %c, 1;
+    bra sloop;
+sdone:
+    cvt.rn.f32.u32 %count, %channels;
+    div.rn.f32 %mean, %sum, %count;
+    mov.f32 %var, 0f00000000;
+    mov.u32 %c, 0;
+vloop:
+    setp.ge.u32 %p, %c, %channels;
+    @%p bra vdone;
+    mul.wide.u32 %off, %c, %spatial;
+    cvt.u64.u32 %addr, %s;
+    add.u64 %off, %off, %addr;
+    shl.b64 %off, %off, 2;
+    add.u64 %addr, %in, %off;
+    ld.global.f32 %val, [%addr];
+    sub.f32 %d, %val, %mean;
+    fma.rn.f32 %var, %d, %d, %var;
+    add.u32 %c, %c, 1;
+    bra vloop;
+vdone:
+    div.rn.f32 %var, %var, %count;
+    add.f32 %var, %var, %eps;
+    sqrt.rn.f32 %inv, %var;
+    rcp.rn.f32 %inv, %inv;
+    mov.u32 %c, 0;
+wloop:
+    setp.ge.u32 %p, %c, %channels;
+    @%p bra wdone;
+    mul.wide.u32 %off, %c, %spatial;
+    cvt.u64.u32 %addr, %s;
+    add.u64 %off, %off, %addr;
+    shl.b64 %off, %off, 2;
+    add.u64 %addr, %in, %off;
+    ld.global.f32 %val, [%addr];
+    sub.f32 %d, %val, %mean;
+    mul.f32 %d, %d, %inv;
+    mul.wide.u32 %off, %c, 4;
+    add.u64 %addr, %wt, %off;
+    ld.global.f32 %scale, [%addr];
+    add.u64 %addr, %bias, %off;
+    ld.global.f32 %shift, [%addr];
+    fma.rn.f32 %val, %d, %scale, %shift;
+    mul.wide.u32 %off, %c, %spatial;
+    cvt.u64.u32 %addr, %s;
+    add.u64 %off, %off, %addr;
+    shl.b64 %off, %off, 2;
+    add.u64 %addr, %out, %off;
+    st.global.f32 [%addr], %val;
+    add.u32 %c, %c, 1;
+    bra wloop;
+wdone:
+    ret;
+}
+
+.visible .entry gate(
+    .param .u64 p_in,
+    .param .u64 p_out,
+    .param .u32 p_c,
+    .param .u32 p_spatial
+)
+{
+    .reg .pred %p;
+    .reg .u32 %gid, %n, %c, %spatial, %cta, %nt;
+    .reg .u64 %in, %out, %addr, %off, %half;
+    .reg .f32 %a, %b;
+    ld.param.u64 %in, [p_in];
+    ld.param.u64 %out, [p_out];
+    ld.param.u32 %c, [p_c];
+    ld.param.u32 %spatial, [p_spatial];
+    mov.u32 %gid, %tid.x;
+    mov.u32 %cta, %ctaid.x;
+    mov.u32 %nt, %ntid.x;
+    mad.lo.u32 %gid, %cta, %nt, %gid;
+    mul.lo.u32 %n, %c, %spatial;
+    setp.ge.u32 %p, %gid, %n;
+    @%p ret;
+    mul.wide.u32 %off, %gid, 4;
+    add.u64 %addr, %in, %off;
+    ld.global.f32 %a, [%addr];
+    mul.wide.u32 %half, %n, 4;
+    add.u64 %addr, %addr, %half;
+    ld.global.f32 %b, [%addr];
+    mul.f32 %a, %a, %b;
+    add.u64 %addr, %out, %off;
+    st.global.f32 [%addr], %a;
+    ret;
+}
+
+.visible .entry ch_mul(
+    .param .u64 p_in,
+    .param .u64 p_scale,
+    .param .u64 p_out,
+    .param .u32 p_c,
+    .param .u32 p_spatial
+)
+{
+    .reg .pred %p;
+    .reg .u32 %gid, %n, %c, %spatial, %oc, %cta, %nt;
+    .reg .u64 %in, %scale, %out, %addr, %off;
+    .reg .f32 %v, %s;
+    ld.param.u64 %in, [p_in];
+    ld.param.u64 %scale, [p_scale];
+    ld.param.u64 %out, [p_out];
+    ld.param.u32 %c, [p_c];
+    ld.param.u32 %spatial, [p_spatial];
+    mov.u32 %gid, %tid.x;
+    mov.u32 %cta, %ctaid.x;
+    mov.u32 %nt, %ntid.x;
+    mad.lo.u32 %gid, %cta, %nt, %gid;
+    mul.lo.u32 %n, %c, %spatial;
+    setp.ge.u32 %p, %gid, %n;
+    @%p ret;
+    div.u32 %oc, %gid, %spatial;
+    mul.wide.u32 %off, %gid, 4;
+    add.u64 %addr, %in, %off;
+    ld.global.f32 %v, [%addr];
+    mul.wide.u32 %off, %oc, 4;
+    add.u64 %addr, %scale, %off;
+    ld.global.f32 %s, [%addr];
+    mul.f32 %v, %v, %s;
+    mul.wide.u32 %off, %gid, 4;
+    add.u64 %addr, %out, %off;
+    st.global.f32 [%addr], %v;
+    ret;
+}
+
+.visible .entry resid(
+    .param .u64 p_x,
+    .param .u64 p_y,
+    .param .u64 p_scale,
+    .param .u32 p_c,
+    .param .u32 p_spatial
+)
+{
+    .reg .pred %p;
+    .reg .u32 %gid, %n, %c, %spatial, %oc, %cta, %nt;
+    .reg .u64 %x, %y, %scale, %addr, %off;
+    .reg .f32 %xv, %yv, %s;
+    ld.param.u64 %x, [p_x];
+    ld.param.u64 %y, [p_y];
+    ld.param.u64 %scale, [p_scale];
+    ld.param.u32 %c, [p_c];
+    ld.param.u32 %spatial, [p_spatial];
+    mov.u32 %gid, %tid.x;
+    mov.u32 %cta, %ctaid.x;
+    mov.u32 %nt, %ntid.x;
+    mad.lo.u32 %gid, %cta, %nt, %gid;
+    mul.lo.u32 %n, %c, %spatial;
+    setp.ge.u32 %p, %gid, %n;
+    @%p ret;
+    div.u32 %oc, %gid, %spatial;
+    mul.wide.u32 %off, %gid, 4;
+    add.u64 %addr, %y, %off;
+    ld.global.f32 %yv, [%addr];
+    mul.wide.u32 %off, %oc, 4;
+    add.u64 %addr, %scale, %off;
+    ld.global.f32 %s, [%addr];
+    mul.f32 %yv, %yv, %s;
+    mul.wide.u32 %off, %gid, 4;
+    add.u64 %addr, %x, %off;
+    ld.global.f32 %xv, [%addr];
+    add.f32 %xv, %xv, %yv;
+    st.global.f32 [%addr], %xv;
+    ret;
+}
+
+.visible .entry add_inplace(
+    .param .u64 p_dst,
+    .param .u64 p_src,
+    .param .u32 p_n
+)
+{
+    .reg .pred %p;
+    .reg .u32 %gid, %n, %cta, %nt;
+    .reg .u64 %dst, %src, %addr, %off;
+    .reg .f32 %a, %b;
+    ld.param.u64 %dst, [p_dst];
+    ld.param.u64 %src, [p_src];
+    ld.param.u32 %n, [p_n];
+    mov.u32 %gid, %tid.x;
+    mov.u32 %cta, %ctaid.x;
+    mov.u32 %nt, %ntid.x;
+    mad.lo.u32 %gid, %cta, %nt, %gid;
+    setp.ge.u32 %p, %gid, %n;
+    @%p ret;
+    mul.wide.u32 %off, %gid, 4;
+    add.u64 %addr, %src, %off;
+    ld.global.f32 %b, [%addr];
+    add.u64 %addr, %dst, %off;
+    ld.global.f32 %a, [%addr];
+    add.f32 %a, %a, %b;
+    st.global.f32 [%addr], %a;
+    ret;
+}
+
+.visible .entry copy_f32(
+    .param .u64 p_dst,
+    .param .u64 p_src,
+    .param .u32 p_n
+)
+{
+    .reg .pred %p;
+    .reg .u32 %gid, %n, %cta, %nt;
+    .reg .u64 %dst, %src, %addr, %off;
+    .reg .f32 %v;
+    ld.param.u64 %dst, [p_dst];
+    ld.param.u64 %src, [p_src];
+    ld.param.u32 %n, [p_n];
+    mov.u32 %gid, %tid.x;
+    mov.u32 %cta, %ctaid.x;
+    mov.u32 %nt, %ntid.x;
+    mad.lo.u32 %gid, %cta, %nt, %gid;
+    setp.ge.u32 %p, %gid, %n;
+    @%p ret;
+    mul.wide.u32 %off, %gid, 4;
+    add.u64 %addr, %src, %off;
+    ld.global.f32 %v, [%addr];
+    add.u64 %addr, %dst, %off;
+    st.global.f32 [%addr], %v;
+    ret;
+}
+
+.visible .entry shuffle2(
+    .param .u64 p_in,
+    .param .u64 p_out,
+    .param .u32 p_oc,
+    .param .u32 p_h,
+    .param .u32 p_width
+)
+{
+    .reg .pred %p;
+    .reg .u32 %gid, %n, %oc, %h, %w, %oh, %ow, %spatial, %s, %c, %oy, %ox, %ic, %iy, %ix, %bit, %cta, %nt;
+    .reg .u64 %in, %out, %addr, %off;
+    .reg .f32 %v;
+    ld.param.u64 %in, [p_in];
+    ld.param.u64 %out, [p_out];
+    ld.param.u32 %oc, [p_oc];
+    ld.param.u32 %h, [p_h];
+    ld.param.u32 %w, [p_width];
+    mov.u32 %gid, %tid.x;
+    mov.u32 %cta, %ctaid.x;
+    mov.u32 %nt, %ntid.x;
+    mad.lo.u32 %gid, %cta, %nt, %gid;
+    shl.b32 %oh, %h, 1;
+    shl.b32 %ow, %w, 1;
+    mul.lo.u32 %spatial, %oh, %ow;
+    mul.lo.u32 %n, %oc, %spatial;
+    setp.ge.u32 %p, %gid, %n;
+    @%p ret;
+    div.u32 %c, %gid, %spatial;
+    rem.u32 %s, %gid, %spatial;
+    div.u32 %oy, %s, %ow;
+    rem.u32 %ox, %s, %ow;
+    shl.b32 %ic, %c, 2;
+    and.b32 %bit, %oy, 1;
+    shl.b32 %bit, %bit, 1;
+    add.u32 %ic, %ic, %bit;
+    and.b32 %bit, %ox, 1;
+    add.u32 %ic, %ic, %bit;
+    shr.u32 %iy, %oy, 1;
+    shr.u32 %ix, %ox, 1;
+    mad.lo.u32 %s, %ic, %h, %iy;
+    mad.lo.u32 %s, %s, %w, %ix;
+    mul.wide.u32 %off, %s, 4;
+    add.u64 %addr, %in, %off;
+    ld.global.f32 %v, [%addr];
+    mul.wide.u32 %off, %gid, 4;
+    add.u64 %addr, %out, %off;
+    st.global.f32 [%addr], %v;
+    ret;
+}
+
+.visible .entry pool_mean(
+    .param .u64 p_in,
+    .param .u64 p_out,
+    .param .u32 p_spatial,
+    .param .f32 p_inv
+)
+{
+    .reg .pred %p;
+    .reg .u32 %tx, %c, %i, %spatial, %stride;
+    .reg .u64 %in, %out, %addr, %off, %base;
+    .reg .f32 %sum, %v, %inv, %other;
+    .shared .align 4 .f32 sm[256];
+    ld.param.u64 %in, [p_in];
+    ld.param.u64 %out, [p_out];
+    ld.param.u32 %spatial, [p_spatial];
+    ld.param.f32 %inv, [p_inv];
+    mov.u32 %c, %ctaid.x;
+    mov.u32 %tx, %tid.x;
+    mul.wide.u32 %base, %c, %spatial;
+    shl.b64 %base, %base, 2;
+    add.u64 %base, %in, %base;
+    mov.f32 %sum, 0f00000000;
+    mov.u32 %i, %tx;
+ploop:
+    setp.ge.u32 %p, %i, %spatial;
+    @%p bra pdone;
+    mul.wide.u32 %off, %i, 4;
+    add.u64 %addr, %base, %off;
+    ld.global.f32 %v, [%addr];
+    add.f32 %sum, %sum, %v;
+    add.u32 %i, %i, 256;
+    bra ploop;
+pdone:
+    mul.wide.u32 %off, %tx, 4;
+    add.u64 %addr, %off, 0;
+    mov.u64 %addr, sm;
+    add.u64 %addr, %addr, %off;
+    st.shared.f32 [%addr], %sum;
+    bar.sync 0;
+    mov.u32 %stride, 128;
+red:
+    setp.eq.u32 %p, %stride, 0;
+    @%p bra reddone;
+    setp.lt.u32 %p, %tx, %stride;
+    @!%p bra rednext;
+    mul.wide.u32 %off, %tx, 4;
+    mov.u64 %addr, sm;
+    add.u64 %addr, %addr, %off;
+    ld.shared.f32 %sum, [%addr];
+    mul.wide.u32 %off, %stride, 4;
+    add.u64 %addr, %addr, %off;
+    ld.shared.f32 %other, [%addr];
+    add.f32 %sum, %sum, %other;
+    mul.wide.u32 %off, %tx, 4;
+    mov.u64 %addr, sm;
+    add.u64 %addr, %addr, %off;
+    st.shared.f32 [%addr], %sum;
+rednext:
+    bar.sync 0;
+    shr.u32 %stride, %stride, 1;
+    bra red;
+reddone:
+    setp.ne.u32 %p, %tx, 0;
+    @%p ret;
+    mov.u64 %addr, sm;
+    ld.shared.f32 %sum, [%addr];
+    mul.f32 %sum, %sum, %inv;
+    mul.wide.u32 %off, %c, 4;
+    add.u64 %addr, %out, %off;
+    st.global.f32 [%addr], %sum;
+    ret;
+}
+
+.visible .entry extract_tile(
+    .param .u64 p_in,
+    .param .u64 p_out,
+    .param .u32 p_c,
+    .param .u32 p_h,
+    .param .u32 p_width,
+    .param .u32 p_y0,
+    .param .u32 p_x0,
+    .param .u32 p_th,
+    .param .u32 p_tw
+)
+{
+    .reg .pred %p;
+    .reg .u32 %gid, %n, %c, %h, %w, %y0, %x0, %th, %tw, %spatial, %s, %ch, %y, %x, %sy, %sx, %si, %cta, %nt;
+    .reg .u64 %in, %out, %addr, %off;
+    .reg .f32 %v;
+    ld.param.u64 %in, [p_in];
+    ld.param.u64 %out, [p_out];
+    ld.param.u32 %c, [p_c];
+    ld.param.u32 %h, [p_h];
+    ld.param.u32 %w, [p_width];
+    ld.param.u32 %y0, [p_y0];
+    ld.param.u32 %x0, [p_x0];
+    ld.param.u32 %th, [p_th];
+    ld.param.u32 %tw, [p_tw];
+    mov.u32 %gid, %tid.x;
+    mov.u32 %cta, %ctaid.x;
+    mov.u32 %nt, %ntid.x;
+    mad.lo.u32 %gid, %cta, %nt, %gid;
+    mul.lo.u32 %spatial, %th, %tw;
+    mul.lo.u32 %n, %c, %spatial;
+    setp.ge.u32 %p, %gid, %n;
+    @%p ret;
+    div.u32 %ch, %gid, %spatial;
+    rem.u32 %s, %gid, %spatial;
+    div.u32 %y, %s, %tw;
+    rem.u32 %x, %s, %tw;
+    add.u32 %sy, %y0, %y;
+    add.u32 %sx, %x0, %x;
+    mad.lo.u32 %si, %ch, %h, %sy;
+    mad.lo.u32 %si, %si, %w, %sx;
+    mul.wide.u32 %off, %si, 4;
+    add.u64 %addr, %in, %off;
+    ld.global.f32 %v, [%addr];
+    mul.wide.u32 %off, %gid, 4;
+    add.u64 %addr, %out, %off;
+    st.global.f32 [%addr], %v;
+    ret;
+}
+
+.visible .entry accumulate(
+    .param .u64 p_pred,
+    .param .u64 p_mask,
+    .param .u64 p_image,
+    .param .u64 p_wsum,
+    .param .u32 p_c,
+    .param .u32 p_h,
+    .param .u32 p_width,
+    .param .u32 p_y0,
+    .param .u32 p_x0,
+    .param .u32 p_th,
+    .param .u32 p_tw
+)
+{
+    .reg .pred %p;
+    .reg .u32 %gid, %n, %c, %h, %w, %y0, %x0, %th, %tw, %y, %x, %sy, %sx, %si, %ch, %pi, %cta, %nt;
+    .reg .u64 %pred, %mask, %image, %wsum, %addr, %off;
+    .reg .f32 %m, %v, %acc;
+    ld.param.u64 %pred, [p_pred];
+    ld.param.u64 %mask, [p_mask];
+    ld.param.u64 %image, [p_image];
+    ld.param.u64 %wsum, [p_wsum];
+    ld.param.u32 %c, [p_c];
+    ld.param.u32 %h, [p_h];
+    ld.param.u32 %w, [p_width];
+    ld.param.u32 %y0, [p_y0];
+    ld.param.u32 %x0, [p_x0];
+    ld.param.u32 %th, [p_th];
+    ld.param.u32 %tw, [p_tw];
+    mov.u32 %gid, %tid.x;
+    mov.u32 %cta, %ctaid.x;
+    mov.u32 %nt, %ntid.x;
+    mad.lo.u32 %gid, %cta, %nt, %gid;
+    mul.lo.u32 %n, %th, %tw;
+    setp.ge.u32 %p, %gid, %n;
+    @%p ret;
+    div.u32 %y, %gid, %tw;
+    rem.u32 %x, %gid, %tw;
+    mul.wide.u32 %off, %gid, 4;
+    add.u64 %addr, %mask, %off;
+    ld.global.f32 %m, [%addr];
+    add.u32 %sy, %y0, %y;
+    add.u32 %sx, %x0, %x;
+    mad.lo.u32 %si, %sy, %w, %sx;
+    mul.wide.u32 %off, %si, 4;
+    add.u64 %addr, %wsum, %off;
+    ld.global.f32 %v, [%addr];
+    add.f32 %v, %v, %m;
+    st.global.f32 [%addr], %v;
+    mov.u32 %ch, 0;
+cloop:
+    setp.ge.u32 %p, %ch, %c;
+    @%p bra cdone;
+    mul.lo.u32 %pi, %ch, %n;
+    add.u32 %pi, %pi, %gid;
+    mul.wide.u32 %off, %pi, 4;
+    add.u64 %addr, %pred, %off;
+    ld.global.f32 %v, [%addr];
+    mul.f32 %v, %v, %m;
+    mad.lo.u32 %si, %ch, %h, %sy;
+    mad.lo.u32 %si, %si, %w, %sx;
+    mul.wide.u32 %off, %si, 4;
+    add.u64 %addr, %image, %off;
+    ld.global.f32 %acc, [%addr];
+    add.f32 %acc, %acc, %v;
+    st.global.f32 [%addr], %acc;
+    add.u32 %ch, %ch, 1;
+    bra cloop;
+cdone:
+    ret;
+}
+
+.visible .entry div_clamp(
+    .param .u64 p_image,
+    .param .u64 p_wsum,
+    .param .u32 p_c,
+    .param .u32 p_spatial
+)
+{
+    .reg .pred %p;
+    .reg .u32 %gid, %n, %c, %spatial, %s, %cta, %nt;
+    .reg .u64 %image, %wsum, %addr, %off;
+    .reg .f32 %v, %w;
+    ld.param.u64 %image, [p_image];
+    ld.param.u64 %wsum, [p_wsum];
+    ld.param.u32 %c, [p_c];
+    ld.param.u32 %spatial, [p_spatial];
+    mov.u32 %gid, %tid.x;
+    mov.u32 %cta, %ctaid.x;
+    mov.u32 %nt, %ntid.x;
+    mad.lo.u32 %gid, %cta, %nt, %gid;
+    mul.lo.u32 %n, %c, %spatial;
+    setp.ge.u32 %p, %gid, %n;
+    @%p ret;
+    rem.u32 %s, %gid, %spatial;
+    mul.wide.u32 %off, %s, 4;
+    add.u64 %addr, %wsum, %off;
+    ld.global.f32 %w, [%addr];
+    max.f32 %w, %w, 0f322BCC77;
+    mul.wide.u32 %off, %gid, 4;
+    add.u64 %addr, %image, %off;
+    ld.global.f32 %v, [%addr];
+    div.rn.f32 %v, %v, %w;
+    max.f32 %v, %v, 0f00000000;
+    min.f32 %v, %v, 0f3F800000;
+    st.global.f32 [%addr], %v;
+    ret;
+}
+
+.visible .entry clamp01(
+    .param .u64 p_image,
+    .param .u32 p_n
+)
+{
+    .reg .pred %p;
+    .reg .u32 %gid, %n, %cta, %nt;
+    .reg .u64 %image, %addr, %off;
+    .reg .f32 %v;
+    ld.param.u64 %image, [p_image];
+    ld.param.u32 %n, [p_n];
+    mov.u32 %gid, %tid.x;
+    mov.u32 %cta, %ctaid.x;
+    mov.u32 %nt, %ntid.x;
+    mad.lo.u32 %gid, %cta, %nt, %gid;
+    setp.ge.u32 %p, %gid, %n;
+    @%p ret;
+    mul.wide.u32 %off, %gid, 4;
+    add.u64 %addr, %image, %off;
+    ld.global.f32 %v, [%addr];
+    max.f32 %v, %v, 0f00000000;
+    min.f32 %v, %v, 0f3F800000;
+    st.global.f32 [%addr], %v;
+    ret;
+}

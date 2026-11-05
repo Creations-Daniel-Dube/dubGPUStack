@@ -117,6 +117,10 @@ impl Gpu {
         })
     }
 
+    pub(crate) fn stream(&self) -> Arc<CudaStream> {
+        self.stream.clone()
+    }
+
     pub fn info(&self) -> Result<GpuInfo, String> {
         device_info(self.stream.context())
     }

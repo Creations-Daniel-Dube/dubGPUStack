@@ -51,6 +51,7 @@ pub struct JobConfig {
     pub drizzle_scale: f64,
     pub pixfrac: f64,
     pub transform: String,
+    pub denoise: bool,
     pub analyze_only: bool,
 }
 
@@ -82,6 +83,7 @@ impl Default for JobConfig {
             drizzle_scale: 1.0,
             pixfrac: 1.0,
             transform: "affine".to_string(),
+            denoise: false,
             analyze_only: false,
         }
     }
@@ -146,6 +148,9 @@ pub struct RunOutput {
 pub fn run(cfg: &JobConfig, cancel: &AtomicBool, mut emit: impl FnMut(Event)) -> Result<RunOutput, String> {
     let started = std::time::Instant::now();
     cfg.validate()?;
+    if cfg.denoise && cfg.rows.is_none() && !cfg.analyze_only {
+        crate::engine::denoise::require_weights()?;
+    }
     emit(Event::Progress { phase: "Démarrage".into(), done: 0.0, total: 1.0, detail: "GPU".into() });
     let gpu = Gpu::new().map_err(|err| format!("GPU indisponible : {err}"))?;
     let info = gpu.info()?;
@@ -490,8 +495,10 @@ fn run_lights(cfg: &JobConfig, gpu: &Gpu, budget: usize, free: usize, total: usi
 }
 
 fn finish_stack(cfg: &JobConfig, gpu: &Gpu, budget: usize, free: usize, total: usize, cancel: &AtomicBool, emit: &mut impl FnMut(Event), samples: Vec<SampleFrame>, channels: usize, region: (i32, i32, i32, i32), reference: &Path, metas: &[sequence::FrameMeta]) -> Result<RunOutput, String> {
-    if !cfg.output_path.is_empty() && Path::new(&cfg.output_path).exists() && !cfg.overwrite && cfg.rows.is_none() {
-        return Err(format!("{} existe déjà", cfg.output_path));
+    if cfg.rows.is_none() && !cfg.output_path.is_empty() && !cfg.overwrite {
+        if let Some(found) = planned_outputs(Path::new(&cfg.output_path), cfg.denoise, cfg.save_coverage).into_iter().find(|path| path.exists()) {
+            return Err(format!("{} existe déjà", found.display()));
+        }
     }
     let width = (region.2 - region.0).max(1) as usize;
     let height = (region.3 - region.1).max(1) as usize;
@@ -545,55 +552,100 @@ fn finish_stack(cfg: &JobConfig, gpu: &Gpu, budget: usize, free: usize, total: u
         emit(Event::Log { level: "ok".into(), message: format!("bande d'essai en {elapsed:.1} s") });
         return Ok(RunOutput { path: String::new(), frames: samples.len(), low: stacked.rejected_low, high: stacked.rejected_high, width: stacked.width, height: stacked.height, channels: stacked.channels, elapsed, preview, preview_w, preview_h, display_ready: false });
     }
-    let out = if cfg.output_path.is_empty() {
+    let base = if cfg.output_path.is_empty() {
         let folder = reference.parent().unwrap_or(Path::new("."));
         auto_output_path(folder, &reference.file_stem().and_then(|s| s.to_str()).unwrap_or("stack"), samples.len(), metas.iter().map(|m| m.exptime).sum())
     } else {
         PathBuf::from(&cfg.output_path)
     };
+    let ext = fits_extension(&base);
+    let stack_path = step_path(&base, "_postStack", &ext);
     let cards = output_cards(cfg, reference, samples.len(), metas, stacked.width, stacked.height);
-    emit(Event::Progress { phase: "Écriture FITS".into(), done: total_rows, total: total_rows, detail: out.display().to_string() });
-    fits::write_fits(&out, &data, stacked.channels, stacked.height, stacked.width, &cards)?;
+    emit(Event::Progress { phase: "Écriture FITS".into(), done: total_rows, total: total_rows, detail: stack_path.display().to_string() });
+    fits::write_fits(&stack_path, &data, stacked.channels, stacked.height, stacked.width, &cards)?;
+    emit(Event::Log { level: "ok".into(), message: format!("écrit {}", stack_path.display()) });
     if let Some(coverage) = &stacked.coverage {
         let cov: Vec<f32> = coverage.iter().map(|v| *v as f32).collect();
-        let cov_path = out.with_file_name(format!("{}_coverage.fit", out.file_stem().and_then(|s| s.to_str()).unwrap_or("stack")));
+        let cov_path = step_path(&base, "_coverage", &ext);
         fits::write_fits(&cov_path, &cov, 1, stacked.height, stacked.width, &[])?;
+        emit(Event::Log { level: "ok".into(), message: format!("écrit {}", cov_path.display()) });
     }
-    emit(Event::Progress { phase: "Stretch HyperMetric".into(), done: 0.0, total: 1.0, detail: out.display().to_string() });
-    let stretched = stretch::auto_stretch_hypermetric(&data, stacked.channels, stacked.height, stacked.width);
+    emit(Event::Progress { phase: "Stretch HyperMetric".into(), done: 0.0, total: 1.0, detail: stack_path.display().to_string() });
+    let mut stretched = stretch::auto_stretch_hypermetric(&data, stacked.channels, stacked.height, stacked.width);
     drop(data);
-    let (stretched_fit, png8, png16, tiff) = stretched_paths(&out);
-    fits::write_fits(&stretched_fit, &stretched.image, stacked.channels, stacked.height, stacked.width, &cards)?;
+    let stretch_path = step_path(&base, "_stretch", &ext);
+    emit(Event::Progress { phase: "Écriture FITS".into(), done: total_rows, total: total_rows, detail: stretch_path.display().to_string() });
+    fits::write_fits(&stretch_path, &stretched.image, stacked.channels, stacked.height, stacked.width, &cards)?;
+    emit(Event::Log { level: "ok".into(), message: format!("écrit {}", stretch_path.display()) });
+    let display_suffix = if cfg.denoise {
+        let tiles = crate::engine::denoise::tile_count_hint(stretched.image.len(), stacked.channels, stacked.height, stacked.width);
+        emit(Event::Progress { phase: "Débruitage".into(), done: 0.0, total: tiles as f64, detail: format!("tuile 0/{tiles}") });
+        let report = crate::engine::denoise::apply(gpu, &mut stretched.image, stacked.channels, stacked.height, stacked.width, cancel, |done, total| {
+            emit(Event::Progress { phase: "Débruitage".into(), done: done as f64, total: total as f64, detail: format!("tuile {done}/{total}") });
+        })?;
+        emit(Event::Log { level: "ok".into(), message: format!("Prism Mini, {} tuiles en {:.1} s", report.tiles, report.seconds) });
+        let dn_path = step_path(&base, "_DN", &ext);
+        emit(Event::Progress { phase: "Écriture FITS".into(), done: total_rows, total: total_rows, detail: dn_path.display().to_string() });
+        fits::write_fits(&dn_path, &stretched.image, stacked.channels, stacked.height, stacked.width, &cards)?;
+        emit(Event::Log { level: "ok".into(), message: format!("écrit {}", dn_path.display()) });
+        "_DN"
+    } else {
+        "_stretch"
+    };
+    let [png8, png16, tiff] = display_paths(&base, display_suffix);
     export::write_png(&png8, &stretched.image, stacked.channels, stacked.height, stacked.width, false)?;
     export::write_png(&png16, &stretched.image, stacked.channels, stacked.height, stacked.width, true)?;
     export::write_tiff32(&tiff, &stretched.image, stacked.channels, stacked.height, stacked.width)?;
     let (preview, preview_h, preview_w) = stack::bin_preview(&stretched.image, stacked.channels, stacked.height, stacked.width, factor);
     emit(Event::Progress { phase: "Stretch HyperMetric".into(), done: 1.0, total: 1.0, detail: format!("Log D {:.2}", stretched.log_d) });
-    emit(Event::Log { level: "ok".into(), message: format!("terminé en {elapsed:.1} s · {}", out.display()) });
+    emit(Event::Log { level: "ok".into(), message: format!("terminé en {elapsed:.1} s · {}", stack_path.display()) });
     emit(Event::Log {
         level: "ok".into(),
         message: format!(
             "HyperMetric Log D = {:.2} · {} · {} · {} · {}",
             stretched.log_d,
-            stretched_fit.display(),
+            stretch_path.display(),
             png8.display(),
             png16.display(),
             tiff.display()
         ),
     });
-    let _ = total_rows;
-    Ok(RunOutput { path: out.display().to_string(), frames: samples.len(), low: stacked.rejected_low, high: stacked.rejected_high, width: stacked.width, height: stacked.height, channels: stacked.channels, elapsed, preview, preview_w, preview_h, display_ready: true })
+    Ok(RunOutput { path: stack_path.display().to_string(), frames: samples.len(), low: stacked.rejected_low, high: stacked.rejected_high, width: stacked.width, height: stacked.height, channels: stacked.channels, elapsed, preview, preview_w, preview_h, display_ready: true })
 }
 
-fn stretched_paths(master: &Path) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
-    let stem = master.file_stem().and_then(|s| s.to_str()).unwrap_or("stack");
-    let dir = master.parent().filter(|dir| !dir.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
-    (
-        dir.join(format!("{stem}_stretched.fit")),
-        dir.join(format!("{stem}_stretched.png")),
-        dir.join(format!("{stem}_stretched_16.png")),
-        dir.join(format!("{stem}_stretched.tiff")),
-    )
+pub fn fits_extension(base: &Path) -> String {
+    match base.extension().and_then(|ext| ext.to_str()).map(|ext| ext.to_ascii_lowercase()).as_deref() {
+        Some("fit" | "fits" | "fts") => base.extension().and_then(|ext| ext.to_str()).unwrap_or("fit").to_string(),
+        _ => "fit".to_string(),
+    }
+}
+
+pub fn step_path(base: &Path, suffix: &str, extension: &str) -> PathBuf {
+    let stem = base.file_stem().and_then(|name| name.to_str()).filter(|name| !name.is_empty()).unwrap_or("stack");
+    let dir = base.parent().filter(|dir| !dir.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
+    dir.join(format!("{stem}{suffix}.{extension}"))
+}
+
+fn display_paths(base: &Path, suffix: &str) -> [PathBuf; 3] {
+    [
+        step_path(base, suffix, "png"),
+        step_path(base, &format!("{suffix}_16"), "png"),
+        step_path(base, suffix, "tiff"),
+    ]
+}
+
+pub fn planned_outputs(base: &Path, denoise: bool, coverage: bool) -> Vec<PathBuf> {
+    let ext = fits_extension(base);
+    let mut paths = vec![step_path(base, "_postStack", &ext), step_path(base, "_stretch", &ext)];
+    let shown = if denoise { "_DN" } else { "_stretch" };
+    if denoise {
+        paths.push(step_path(base, "_DN", &ext));
+    }
+    paths.extend(display_paths(base, shown));
+    if coverage {
+        paths.push(step_path(base, "_coverage", &ext));
+    }
+    paths
 }
 
 fn coefficients(cfg: &JobConfig, frames: &[Frame], reference: &Frame, layers: usize, reg_layer: Option<usize>, stats_map: &HashMap<i64, FrameStats>, all: &[Frame]) -> Result<(Vec<[f64; 3]>, Vec<[f64; 3]>, Vec<[f64; 3]>), String> {
@@ -690,7 +742,7 @@ pub fn auto_output_path(folder: &Path, name: &str, frames: usize, seconds: f64) 
     let base = folder.join(format!("{name}_{frames}frames_{:.1}h_gpu_{stamp}", seconds / 3600.0));
     let mut path = base.with_extension("fit");
     let mut k = 2;
-    while path.exists() {
+    while planned_outputs(&path, true, true).iter().any(|item| item.exists()) || display_paths(&path, "_stretch").iter().any(|item| item.exists()) {
         path = PathBuf::from(format!("{}_{k}.fit", base.display()));
         k += 1;
     }
@@ -895,5 +947,21 @@ mod tests {
         assert!(cfg.validate().is_err());
         cfg.pixfrac = 1.0;
         assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn step_names_follow_the_output_stem() {
+        let base = PathBuf::from("stacks").join("M42.fits");
+        assert_eq!(fits_extension(&base), "fits");
+        assert_eq!(fits_extension(Path::new("M42")), "fit");
+        assert_eq!(step_path(&base, "_postStack", "fits"), PathBuf::from("stacks").join("M42_postStack.fits"));
+        assert_eq!(step_path(&base, "_stretch", "fits"), PathBuf::from("stacks").join("M42_stretch.fits"));
+        assert_eq!(step_path(&base, "_DN", "fits"), PathBuf::from("stacks").join("M42_DN.fits"));
+        let names: Vec<_> = planned_outputs(&base, true, true).iter().map(|path| path.file_name().unwrap().to_string_lossy().into_owned()).collect();
+        assert!(names.contains(&"M42_postStack.fits".to_string()));
+        assert!(names.contains(&"M42_stretch.fits".to_string()));
+        assert!(names.contains(&"M42_DN.fits".to_string()));
+        assert!(names.contains(&"M42_DN.tiff".to_string()));
+        assert!(names.contains(&"M42_coverage.fits".to_string()));
     }
 }

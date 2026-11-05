@@ -17,6 +17,9 @@ pub fn dispatch(args: &[String]) -> Option<i32> {
     if command == "stack" {
         return Some(stack(&args[1..]));
     }
+    if command == "prism-check" {
+        return Some(prism_check());
+    }
     if command == "--help" || command == "-h" || command == "help" {
         print_help();
         return Some(0);
@@ -95,6 +98,7 @@ fn stack_config(args: &[String]) -> Result<JobConfig, i32> {
             "--pixfrac" => { cfg.pixfrac = take(args, &mut index)?.parse().unwrap_or(0.0); Ok(()) }
             "--transform" => { cfg.transform = take(args, &mut index)?.to_string(); Ok(()) }
             "--analyze-only" => { cfg.analyze_only = true; Ok(()) }
+            "--denoise" => { cfg.denoise = true; Ok(()) }
             "--strip" => { cfg.strip = take(args, &mut index)?.parse().unwrap_or(0); Ok(()) }
             "--tile" => { cfg.tile = take(args, &mut index)?.parse().unwrap_or(0); Ok(()) }
             "--workers" => { cfg.workers = take(args, &mut index)?.parse().unwrap_or(6); Ok(()) }
@@ -162,14 +166,36 @@ fn is_user(err: &str) -> bool {
     err.contains("indiquez") || err.contains("doit") || err.contains("sélectionnez") || err.contains("au moins") || err.contains("introuvable") || err.contains("existe déjà") || err.contains("reconnue") || err.contains("n'est pas")
 }
 
+fn prism_check() -> i32 {
+    let gpu = match gpu::Gpu::new() {
+        Ok(gpu) => gpu,
+        Err(err) => {
+            println(&format!("GPU indisponible : {err}"));
+            return 1;
+        }
+    };
+    match crate::engine::denoise::run_check(&gpu) {
+        Ok(report) => {
+            println(&report);
+            0
+        }
+        Err(err) => {
+            println(&err);
+            1
+        }
+    }
+}
+
 fn print_help() {
     println("dubGPUStack probe");
+    println("dubGPUStack prism-check");
     println("dubGPUStack stack SEQ_OU_DOSSIER [--out FICHIER] [--rejection winsorized|sigma|none]");
     println("  [--sigma BAS HAUT] [--weight none|noise|wfwhm|nbstars] [--feather PIXELS]");
     println("  [--no-norm] [--no-rgb-equal] [--no-output-norm] [--rows Y0 Y1] [--crop X Y W H]");
     println("  [--overwrite] [--gpu-mem-gib N] [--scale 1|1.5|2|3] [--pixfrac 0.05..1]");
-    println("  [--transform affine|similarity] [--strip N] [--tile N] [--workers N] [--analyze-only]");
+    println("  [--transform affine|similarity] [--strip N] [--tile N] [--workers N] [--analyze-only] [--denoise]");
     println("  strip et tile à 0 choisissent la bande selon la mémoire libre");
+    println("  --out est le nom de base : les fichiers reçoivent _postStack, _stretch et _DN");
     println("Sans argument, ou avec un chemin, l'interface s'ouvre.");
 }
 

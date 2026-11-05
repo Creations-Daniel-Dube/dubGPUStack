@@ -225,6 +225,7 @@ impl App {
     }
 
     fn open_path(&mut self, path: &Path) {
+        let previous = self.loaded.as_ref().map(|loaded| loaded.path.clone());
         let path = if path.is_file() && !path.extension().and_then(|ext| ext.to_str()).unwrap_or("").eq_ignore_ascii_case("seq") {
             path.parent().unwrap_or(path)
         } else {
@@ -233,17 +234,79 @@ impl App {
         let result = if path.is_file() { self.load_seq(path) } else { self.load_lights(path) };
         match result {
             Ok(()) => {
+                let current = self.loaded.as_ref().map(|loaded| loaded.path.clone());
+                if current.as_deref() != previous.as_deref() {
+                    self.output_path.clear();
+                    self.confirm = false;
+                }
                 self.settings.remember(&path.display().to_string());
                 self.push("info", &format!("ouvert {}", path.display()));
                 let count = self.loaded.as_ref().map(|loaded| loaded.rows.len()).unwrap_or(0);
                 self.summary = format!("{count} images chargées");
                 self.refresh_coverage();
+                self.ask_output_name();
             }
             Err(err) => {
                 self.push("error", &err);
                 self.tab = Tab::Log;
             }
         }
+    }
+
+    fn ask_output_name(&mut self) {
+        let dialog = rfd::FileDialog::new()
+            .set_title("Nom de sortie")
+            .set_directory(self.output_directory())
+            .set_file_name(self.suggest_output_file())
+            .add_filter("FITS", &["fit", "fits"]);
+        if let Some(path) = dialog.save_file() {
+            self.output_path = path.display().to_string();
+            self.confirm = false;
+            self.push("info", &format!("nom de sortie {}", short_path(&self.output_path)));
+        }
+    }
+
+    fn output_directory(&self) -> PathBuf {
+        if !self.output_path.is_empty() {
+            if let Some(parent) = Path::new(&self.output_path).parent() {
+                if parent.is_dir() {
+                    return parent.to_path_buf();
+                }
+            }
+        }
+        if let Some(loaded) = &self.loaded {
+            if loaded.folder.is_dir() {
+                return loaded.folder.clone();
+            }
+        }
+        PathBuf::from(&self.settings.last_dir)
+    }
+
+    fn suggest_output_file(&self) -> String {
+        if !self.output_path.is_empty() {
+            if let Some(name) = Path::new(&self.output_path).file_name().and_then(|name| name.to_str()) {
+                return name.to_string();
+            }
+        }
+        let Some(loaded) = &self.loaded else { return "stack.fit".to_string() };
+        let stem = if loaded.lights {
+            loaded.folder.file_name().and_then(|name| name.to_str()).unwrap_or("stack")
+        } else {
+            Path::new(&loaded.path).file_stem().and_then(|name| name.to_str()).unwrap_or("stack")
+        };
+        let stem: String = stem.chars().map(|ch| if ch.is_ascii_alphanumeric() || "_-+.".contains(ch) { ch } else { '_' }).collect();
+        let stem = if stem.is_empty() { "stack".to_string() } else { stem };
+        format!("{stem}.fit")
+    }
+
+    fn output_clash(&self) -> Option<String> {
+        if self.output_path.is_empty() {
+            return None;
+        }
+        job::planned_outputs(Path::new(&self.output_path), self.settings.denoise, self.settings.save_coverage)
+            .into_iter()
+            .find(|path| path.exists())
+            .map(|path| path.display().to_string())
     }
 
     fn apply_analysis(&mut self) {
@@ -463,6 +526,7 @@ impl App {
             drizzle_scale: self.settings.drizzle_scale,
             pixfrac: self.settings.pixfrac,
             transform: self.settings.transform.clone(),
+            denoise: self.settings.denoise && rows.is_none() && !analyze_only,
             analyze_only,
         };
         cfg.validate()?;
@@ -480,11 +544,12 @@ impl App {
         if !analyze_only && !test_strip {
             if !self.output_path.is_empty() {
                 let path = self.output_path.clone();
-                let exists = Path::new(&path).exists();
-                if exists && !self.confirm {
-                    self.confirm = true;
-                    self.push("warn", &format!("{path} existe. Confirmez l'écrasement."));
-                    return;
+                if let Some(found) = self.output_clash() {
+                    if !self.confirm {
+                        self.confirm = true;
+                        self.push("warn", &format!("{found} existe. Confirmez l'écrasement."));
+                        return;
+                    }
                 }
                 if let Some(free) = free_bytes(Path::new(&path).parent().unwrap_or(Path::new("."))) {
                     let loaded = self.loaded.as_ref();
@@ -600,7 +665,7 @@ impl App {
                     }
                     ui.close();
                 }
-                if ui.button("Empiler").on_hover_text("Empile les images sélectionnées et écrit le FITS.").clicked() { self.start(false, false); ui.close(); }
+                if ui.button("Empiler").on_hover_text("Empile les images sélectionnées. Écrit le FITS _postStack, puis _stretch, puis _DN si le débruitage est actif.").clicked() { self.start(false, false); ui.close(); }
                 if ui.button("Quitter").on_hover_text("Ferme dubGPUStack.").clicked() { ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close); }
             }).response.on_hover_text("Ouvrir, recharger ou quitter.");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -652,15 +717,17 @@ impl App {
                         ui.add(DragValue::new(&mut self.crop_h).range(0..=200000).prefix("h ")).on_hover_text("Hauteur du recadrage, en pixels.");
                     });
                 }
-                if ui.button("Choisir le fichier de sortie…").on_hover_text("Choisit le fichier FITS écrit par l'empilement.").clicked() {
-                    if let Some(path) = rfd::FileDialog::new().set_directory(&self.settings.last_dir).add_filter("FITS", &["fit", "fits"]).save_file() {
-                        self.output_path = path.display().to_string();
-                        self.confirm = false;
-                    }
+                if ui.button("Choisir le fichier de sortie…").on_hover_text("Change le nom de base. Chaque enregistrement ajoute le suffixe de l'étape : _postStack, _stretch, _DN.").clicked() {
+                    self.ask_output_name();
                 }
-                let name_tip = if self.output_path.is_empty() { "Nom choisi automatiquement à l'empilement." } else { "Fichier de sortie actuel." };
+                let name_tip = if self.output_path.is_empty() {
+                    "Sans nom choisi, un nom automatique est créé à l'empilement. Les fichiers reçoivent _postStack, _stretch et, si le débruitage est actif, _DN."
+                } else {
+                    "Nom de base, sans suffixe. L'empilement écrit ce nom avec _postStack, _stretch et, si le débruitage est actif, _DN."
+                };
                 ui.label(if self.output_path.is_empty() { "Nom automatique".to_string() } else { short_path(&self.output_path) }).on_hover_text(name_tip);
-                ui.checkbox(&mut self.settings.save_coverage, "Carte de couverture").on_hover_text("Écrit aussi la carte du nombre d'images par pixel.");
+                ui.checkbox(&mut self.settings.save_coverage, "Carte de couverture").on_hover_text("Écrit aussi la carte du nombre d'images par pixel, avec le suffixe _coverage.");
+                ui.checkbox(&mut self.settings.denoise, "Débruitage Prism Mini").on_hover_text("Après le FITS _stretch, retire le bruit puis écrit le FITS _DN. Le FITS linéaire _postStack reste inchangé. Réglages figés : force 90 %, tuile 512, recouvrement 96.");
             });
             advanced_toggle(ui, &mut self.advanced_open);
             if self.advanced_open {
@@ -711,7 +778,7 @@ impl App {
         if ui.add_enabled(!self.busy, egui::Button::new(RichText::new(test).size(16.0)).min_size(wide)).on_hover_text("Empile une bande de 192 lignes au plus couvert, sans écrire de fichier.").clicked() {
             self.start(false, true);
         }
-        if ui.add_enabled(!self.busy, egui::Button::new(RichText::new(stack).size(16.0)).min_size(wide)).on_hover_text("Empile les images sélectionnées et écrit le FITS.").clicked() {
+        if ui.add_enabled(!self.busy, egui::Button::new(RichText::new(stack).size(16.0)).min_size(wide)).on_hover_text("Empile les images sélectionnées. Écrit le FITS _postStack, puis _stretch, puis _DN si le débruitage est actif.").clicked() {
             self.start(false, false);
         }
         if self.busy {
@@ -719,7 +786,7 @@ impl App {
             if ui.button("Annuler").on_hover_text("Interrompt le calcul en cours.").clicked() { self.cancel_job(); }
         }
         if self.confirm {
-            ui.label("Le fichier de sortie existe déjà.");
+            ui.label("Un fichier de cette série existe déjà.");
             ui.horizontal(|ui| {
                 if ui.button("Écraser").on_hover_text("Remplace le fichier de sortie existant.").clicked() { self.start(false, false); }
                 if ui.button("Garder").on_hover_text("Annule l'écriture et conserve le fichier existant.").clicked() { self.confirm = false; }
