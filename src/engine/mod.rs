@@ -10,6 +10,7 @@ pub mod job;
 pub mod lights;
 pub mod masks;
 pub mod register;
+pub mod rotate_crop;
 pub mod sequence;
 pub mod stack;
 pub mod stars;

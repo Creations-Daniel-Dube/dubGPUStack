@@ -137,7 +137,7 @@ fn run_stack(cfg: JobConfig) -> i32 {
     let cancel = Arc::new(AtomicBool::new(false));
     let flag = Arc::clone(&cancel);
     let _ = ctrlc::set_handler(move || flag.store(true, Ordering::Relaxed));
-    match job::run(&cfg, &cancel, |event| match event {
+    match job::run(&cfg, &cancel, None, |event| match event {
         Event::Log { level, message } => println(&format!("[{level}] {message}")),
         Event::Progress { phase, done, total, detail } => println(&format!("{phase} {done:.0}/{total:.0} {detail}")),
     }) {

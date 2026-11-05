@@ -122,20 +122,35 @@ fn ort_env() -> Result<ort::environment::Environment, String> {
     ort::init_from(&dll).map_err(|err| format!("ONNX Runtime : {err}"))?.build().map_err(|err| format!("ONNX Runtime : {err}"))
 }
 
+fn runtime_library_names() -> &'static [&'static str] {
+    if cfg!(windows) {
+        &["onnxruntime.dll"]
+    } else {
+        &["libonnxruntime.so", "libonnxruntime.so.1"]
+    }
+}
+
 fn require_runtime() -> Result<PathBuf, String> {
     for candidate in runtime_candidates() {
         if candidate.is_file() {
             return Ok(candidate);
         }
     }
-    Err("onnxruntime.dll 1.31 introuvable. Placez-le dans le dossier onnxruntime, ou à côté de dubGPUStack.exe.".to_string())
+    let name = runtime_library_names()[0];
+    if cfg!(windows) {
+        Err(format!("{name} 1.31 introuvable. Placez-le dans le dossier onnxruntime, ou à côté de dubGPUStack.exe."))
+    } else {
+        Err(format!("{name} 1.31 introuvable. Placez-le dans le dossier onnxruntime, onnxruntime/lib, ou à côté de l'exécutable."))
+    }
 }
 
 fn runtime_candidates() -> Vec<PathBuf> {
     let mut candidates = Vec::new();
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            candidates.push(dir.join("onnxruntime.dll"));
+            for name in runtime_library_names() {
+                candidates.push(dir.join(name));
+            }
             push_runtime(&mut candidates, dir);
         }
     }
@@ -149,8 +164,10 @@ fn push_runtime(candidates: &mut Vec<PathBuf>, start: &Path) {
     let mut current = Some(start);
     for _ in 0..8 {
         let Some(dir) = current else { break };
-        candidates.push(dir.join("onnxruntime").join("onnxruntime.dll"));
-        candidates.push(dir.join("onnxruntime").join("lib").join("onnxruntime.dll"));
+        for name in runtime_library_names() {
+            candidates.push(dir.join("onnxruntime").join(name));
+            candidates.push(dir.join("onnxruntime").join("lib").join(name));
+        }
         current = dir.parent();
     }
 }

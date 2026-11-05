@@ -3,15 +3,16 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::Arc;
 
 use eframe::egui::{self, Color32, RichText, Stroke};
 use egui::{ComboBox, DragValue, Frame, TextureHandle};
 
 use crate::engine::cache::{self, Analysis};
-use crate::engine::job::{self, Event, JobConfig, RunOutput};
+use crate::engine::job::{self, CropDecision, Event, JobConfig, RunOutput};
 use crate::engine::lights;
+use crate::engine::rotate_crop::{self, Interpolation, Spec};
 use crate::engine::sequence;
 use crate::engine::stretch;
 use crate::gpu;
@@ -62,6 +63,23 @@ enum Note {
     Finished(Result<RunOutput, String>),
 }
 
+struct CropUi {
+    full_w: f64,
+    full_h: f64,
+    preview_w: f32,
+    preview_h: f32,
+    rect: Option<rotate_crop::Rect>,
+    interpolation: Interpolation,
+    clamp: bool,
+    drag: CropDrag,
+}
+
+enum CropDrag {
+    None,
+    Draw { start: [f64; 2] },
+    Edge { edge: usize, origin: rotate_crop::Rect, press: [f64; 2] },
+}
+
 pub struct App {
     settings: Settings,
     loaded: Option<Loaded>,
@@ -87,6 +105,9 @@ pub struct App {
     crop_y: i32,
     crop_w: i32,
     crop_h: i32,
+    crop_rx: Option<Receiver<job::CropPause>>,
+    crop_reply: Option<mpsc::Sender<CropDecision>>,
+    crop_ui: Option<CropUi>,
     advanced_open: bool,
     open_at_start: Option<String>,
 }
@@ -120,6 +141,9 @@ impl App {
             crop_y: 0,
             crop_w: 0,
             crop_h: 0,
+            crop_rx: None,
+            crop_reply: None,
+            crop_ui: None,
             advanced_open: false,
             open_at_start: open,
         };
@@ -168,6 +192,9 @@ impl App {
                     self.busy = false;
                     self.job = JobKind::None;
                     self.cancel = None;
+                    self.crop_ui = None;
+                    self.crop_rx = None;
+                    self.crop_reply = None;
                     match result {
                         Ok(output) => self.finish_ok(ctx, output),
                         Err(err) if err == "cancelled" => self.push("warn", "annulé"),
@@ -184,9 +211,51 @@ impl App {
         if again {
             self.rx = Some(rx);
         }
+        self.poll_crop(ctx);
         if self.busy {
             ctx.request_repaint();
         }
+    }
+
+    fn poll_crop(&mut self, ctx: &egui::Context) {
+        let Some(rx) = self.crop_rx.take() else { return };
+        match rx.try_recv() {
+            Ok(pause) => {
+                self.crop_rx = Some(rx);
+                self.begin_crop(ctx, pause);
+            }
+            Err(TryRecvError::Empty) => self.crop_rx = Some(rx),
+            Err(TryRecvError::Disconnected) => {}
+        }
+    }
+
+    fn begin_crop(&mut self, ctx: &egui::Context, pause: job::CropPause) {
+        if pause.preview_w > 0 && pause.preview_h > 0 && pause.rgba.len() >= pause.preview_w * pause.preview_h * 4 {
+            let image = egui::ColorImage::from_rgba_unmultiplied([pause.preview_w, pause.preview_h], &pause.rgba);
+            self.preview = Some(ctx.load_texture("recadrage", image, egui::TextureOptions::LINEAR));
+        }
+        self.crop_ui = Some(CropUi {
+            full_w: pause.width.max(1) as f64,
+            full_h: pause.height.max(1) as f64,
+            preview_w: pause.preview_w.max(1) as f32,
+            preview_h: pause.preview_h.max(1) as f32,
+            rect: None,
+            interpolation: Interpolation::Lanczos4,
+            clamp: true,
+            drag: CropDrag::None,
+        });
+        self.tab = Tab::Result;
+        self.phase = "Recadrage · dessinez la zone à garder".into();
+        self.fraction = 0.0;
+    }
+
+    fn finish_crop(&mut self, decision: CropDecision) {
+        let applying = matches!(decision, CropDecision::Apply(_));
+        if let Some(tx) = self.crop_reply.take() {
+            let _ = tx.send(decision);
+        }
+        self.crop_ui = None;
+        self.phase = if applying { "Recadrage · application".into() } else { "Extraction de fond".into() };
     }
 
     fn finish_ok(&mut self, ctx: &egui::Context, output: RunOutput) {
@@ -586,10 +655,23 @@ impl App {
         self.busy = true;
         self.confirm = false;
         self.fraction = 0.0;
+        let gate = if !analyze_only && !test_strip {
+            let (pause_tx, pause_rx) = mpsc::channel();
+            let (decision_tx, decision_rx) = mpsc::channel();
+            self.crop_rx = Some(pause_rx);
+            self.crop_reply = Some(decision_tx);
+            self.crop_ui = None;
+            Some(job::CropGate { pause_tx, decision_rx })
+        } else {
+            self.crop_rx = None;
+            self.crop_reply = None;
+            self.crop_ui = None;
+            None
+        };
         let tx_job = tx.clone();
         std::thread::spawn(move || {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                job::run(&cfg, &flag, |event| {
+                job::run(&cfg, &flag, gate.as_ref(), |event| {
                     let note = match event {
                         Event::Log { level, message } => Note::Log(level, message),
                         Event::Progress { phase, done, total, detail } => Note::Progress(phase, done, total, detail),
@@ -665,7 +747,7 @@ impl App {
                     }
                     ui.close();
                 }
-                if ui.button("Empiler").on_hover_text("Empile les images sélectionnées. Écrit le FITS _postStack, puis _stretch, _BGE, _AB, puis _DN si le débruitage est actif.").clicked() { self.start(false, false); ui.close(); }
+                if ui.button("Empiler").on_hover_text("Empile les images sélectionnées. Écrit le FITS _postStack, puis _stretch. Le calcul s'arrête pour recadrer et redresser, puis enchaîne _BGE, _AB et, si le débruitage est actif, _DN.").clicked() { self.start(false, false); ui.close(); }
                 if ui.button("Quitter").on_hover_text("Ferme dubGPUStack.").clicked() { ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close); }
             }).response.on_hover_text("Ouvrir, recharger ou quitter.");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -778,7 +860,7 @@ impl App {
         if ui.add_enabled(!self.busy, egui::Button::new(RichText::new(test).size(16.0)).min_size(wide)).on_hover_text("Empile une bande de 192 lignes au plus couvert, sans écrire de fichier.").clicked() {
             self.start(false, true);
         }
-        if ui.add_enabled(!self.busy, egui::Button::new(RichText::new(stack).size(16.0)).min_size(wide)).on_hover_text("Empile les images sélectionnées. Écrit le FITS _postStack, puis _stretch, _BGE, _AB, puis _DN si le débruitage est actif.").clicked() {
+        if ui.add_enabled(!self.busy, egui::Button::new(RichText::new(stack).size(16.0)).min_size(wide)).on_hover_text("Empile les images sélectionnées. Écrit le FITS _postStack, puis _stretch. Le calcul s'arrête pour recadrer et redresser, puis enchaîne _BGE, _AB et, si le débruitage est actif, _DN.").clicked() {
             self.start(false, false);
         }
         if self.busy {
@@ -988,6 +1070,7 @@ impl eframe::App for App {
             Tab::Result => self.result_tab(ui),
             Tab::Log => self.log_tab(ui),
         });
+        self.crop_window(&ctx);
         if self.busy {
             ctx.request_repaint();
         } else {
@@ -1002,6 +1085,66 @@ fn text_line(ui: &egui::Ui) -> f32 {
 
 /// La texture est affichée à sa taille en pixels par défaut. Une brute portrait
 /// dépasse alors le bas du panneau. On la ramène dans le rectangle encore visible.
+fn letterbox(area: egui::Rect, img_w: f32, img_h: f32) -> egui::Rect {
+    let img_w = img_w.max(1.0);
+    let img_h = img_h.max(1.0);
+    let scale = (area.width() / img_w).min(area.height() / img_h);
+    let size = egui::vec2(img_w * scale, img_h * scale);
+    let origin = egui::pos2(area.left() + (area.width() - size.x) * 0.5, area.top() + (area.height() - size.y) * 0.5);
+    egui::Rect::from_min_size(origin, size)
+}
+
+fn screen_to_full(pos: egui::Pos2, image: egui::Rect, full_w: f64, full_h: f64) -> [f64; 2] {
+    let u = ((pos.x - image.left()) / image.width().max(1.0)) as f64;
+    let v = ((pos.y - image.top()) / image.height().max(1.0)) as f64;
+    [u * full_w, v * full_h]
+}
+
+fn full_to_screen(point: [f64; 2], image: egui::Rect, full_w: f64, full_h: f64) -> egui::Pos2 {
+    egui::pos2(
+        image.left() + (point[0] / full_w) as f32 * image.width(),
+        image.top() + (point[1] / full_h) as f32 * image.height(),
+    )
+}
+
+fn dist_to_segment(point: egui::Pos2, start: egui::Pos2, end: egui::Pos2) -> f32 {
+    let side = end - start;
+    let len2 = side.length_sq();
+    if len2 <= f32::EPSILON {
+        return (point - start).length();
+    }
+    let t = ((point - start).dot(side) / len2).clamp(0.0, 1.0);
+    (point - (start + side * t)).length()
+}
+
+fn hit_edge(pos: egui::Pos2, rect: &rotate_crop::Rect, image: egui::Rect, full_w: f64, full_h: f64) -> Option<usize> {
+    let pts: [egui::Pos2; 4] = rotate_crop::corners(rect).map(|point| full_to_screen(point, image, full_w, full_h));
+    let mut best = None;
+    let mut best_d = 8.0f32;
+    for edge in 0..4 {
+        let distance = dist_to_segment(pos, pts[edge], pts[(edge + 1) % 4]);
+        if distance <= best_d {
+            best_d = distance;
+            best = Some(edge);
+        }
+    }
+    best
+}
+
+fn cursor_for_normal(normal: [f64; 2]) -> egui::CursorIcon {
+    let ax = normal[0].abs();
+    let ay = normal[1].abs();
+    if ax > ay * 2.0 {
+        egui::CursorIcon::ResizeHorizontal
+    } else if ay > ax * 2.0 {
+        egui::CursorIcon::ResizeVertical
+    } else if normal[0] * normal[1] >= 0.0 {
+        egui::CursorIcon::ResizeNwSe
+    } else {
+        egui::CursorIcon::ResizeNeSw
+    }
+}
+
 fn show_fitted_image(ui: &mut egui::Ui, tex: &TextureHandle, reserve_below: f32) {
     let width = ui.available_width().max(1.0);
     let height = (ui.clip_rect().bottom() - ui.cursor().top() - reserve_below).max(1.0);
@@ -1020,6 +1163,11 @@ fn panic_text(payload: Box<dyn std::any::Any + Send>) -> String {
 
 impl App {
     fn result_tab(&mut self, ui: &mut egui::Ui) {
+        if self.crop_ui.is_some() {
+            ui.label("Tracez un rectangle, faites-le tourner, puis Appliquer.").on_hover_text("Le rectangle rouge est la zone gardée. L'image résultante est redressée, sans bandes noires.");
+            self.crop_canvas(ui);
+            return;
+        }
         ui.checkbox(&mut self.linked, "Étirement lié").on_hover_text("Lie les trois couches pour l'étirement de l'aperçu.");
         if let Some(tex) = &self.preview {
             show_fitted_image(ui, tex, text_line(ui) + ui.spacing().interact_size.y + ui.spacing().item_spacing.y);
@@ -1036,6 +1184,153 @@ impl App {
                 ui.ctx().copy_text(self.result_path.clone());
             }
         });
+    }
+
+    fn crop_canvas(&mut self, ui: &mut egui::Ui) {
+        let tex = self.preview.clone();
+        let mut session = match self.crop_ui.take() {
+            Some(session) => session,
+            None => return,
+        };
+        let width = ui.available_width().max(1.0);
+        let height = (ui.clip_rect().bottom() - ui.cursor().top()).max(1.0);
+        let (area, response) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::click_and_drag());
+        let image_rect = letterbox(area, session.preview_w, session.preview_h);
+        if response.drag_started() {
+            if let Some(pos) = response.interact_pointer_pos() {
+                if image_rect.contains(pos) {
+                    let full = screen_to_full(pos, image_rect, session.full_w, session.full_h);
+                    let edge_hit = session.rect.and_then(|rect| hit_edge(pos, &rect, image_rect, session.full_w, session.full_h).map(|edge| (edge, rect)));
+                    if let Some((edge, origin)) = edge_hit {
+                        session.drag = CropDrag::Edge { edge, origin, press: full };
+                    } else {
+                        session.rect = None;
+                        session.drag = CropDrag::Draw { start: full };
+                    }
+                }
+            }
+        }
+        if response.dragged() {
+            if let Some(pos) = response.interact_pointer_pos() {
+                let full = screen_to_full(pos, image_rect, session.full_w, session.full_h);
+                match session.drag {
+                    CropDrag::Draw { start } => {
+                        let x0 = start[0].clamp(0.0, session.full_w);
+                        let y0 = start[1].clamp(0.0, session.full_h);
+                        let x1 = full[0].clamp(0.0, session.full_w);
+                        let y1 = full[1].clamp(0.0, session.full_h);
+                        session.rect = Some(rotate_crop::Rect {
+                            center_x: (x0 + x1) * 0.5,
+                            center_y: (y0 + y1) * 0.5,
+                            width: (x1 - x0).abs(),
+                            height: (y1 - y0).abs(),
+                            angle_deg: 0.0,
+                        });
+                    }
+                    CropDrag::Edge { edge, origin, press } => {
+                        let normal = rotate_crop::outward_normal(&origin, edge);
+                        let along = (full[0] - press[0]) * normal[0] + (full[1] - press[1]) * normal[1];
+                        let mut moved = origin;
+                        rotate_crop::move_edge(&mut moved, edge, along, 8.0);
+                        session.rect = Some(moved);
+                    }
+                    CropDrag::None => {}
+                }
+            }
+        }
+        if response.drag_stopped() {
+            if session.rect.is_some_and(|rect| rect.width < 2.0 && rect.height < 2.0) {
+                session.rect = None;
+            }
+            session.drag = CropDrag::None;
+        }
+        if let Some(tex) = &tex {
+            ui.painter().image(tex.id(), image_rect, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
+        }
+        if let Some(rect) = session.rect {
+            let mut pts: Vec<egui::Pos2> = rotate_crop::corners(&rect).into_iter().map(|point| full_to_screen(point, image_rect, session.full_w, session.full_h)).collect();
+            if let Some(first) = pts.first().copied() {
+                pts.push(first);
+                ui.painter().line(pts, Stroke::new(2.0, Color32::from_rgb(255, 40, 40)));
+            }
+        }
+        if let Some(pos) = response.hover_pos() {
+            let cursor = if let Some(rect) = session.rect.as_ref() {
+                if let Some(edge) = hit_edge(pos, rect, image_rect, session.full_w, session.full_h) {
+                    Some(cursor_for_normal(rotate_crop::outward_normal(rect, edge)))
+                } else if image_rect.contains(pos) {
+                    Some(egui::CursorIcon::Crosshair)
+                } else {
+                    None
+                }
+            } else if image_rect.contains(pos) {
+                Some(egui::CursorIcon::Crosshair)
+            } else {
+                None
+            };
+            if let Some(cursor) = cursor {
+                response.clone().on_hover_cursor(cursor);
+            }
+        }
+        self.crop_ui = Some(session);
+    }
+
+    fn crop_window(&mut self, ctx: &egui::Context) {
+        let mut session = match self.crop_ui.take() {
+            Some(session) => session,
+            None => return,
+        };
+        let mut decision = None;
+        egui::Window::new("Rotation et recadrage")
+            .collapsible(false)
+            .resizable(false)
+            .default_pos(egui::pos2(380.0, 48.0))
+            .show(ctx, |ui| {
+                ui.set_min_width(280.0);
+                let has_rect = session.rect.is_some();
+                let mut angle = session.rect.map(|rect| rect.angle_deg).unwrap_or(0.0);
+                ui.horizontal(|ui| {
+                    ui.label("Angle (°)");
+                    ui.add_enabled(has_rect, DragValue::new(&mut angle).range(-180.0..=180.0).speed(0.05).max_decimals(2))
+                        .on_hover_text("Angle du rectangle, en degrés. Une valeur positive tourne dans le sens horaire.");
+                    if ui.add_enabled(has_rect, egui::Button::new("−")).on_hover_text("Tourne le rectangle de 0,1° dans le sens antihoraire.").clicked() {
+                        angle = (angle - 0.1).clamp(-180.0, 180.0);
+                    }
+                    if ui.add_enabled(has_rect, egui::Button::new("+")).on_hover_text("Tourne le rectangle de 0,1° dans le sens horaire.").clicked() {
+                        angle = (angle + 0.1).clamp(-180.0, 180.0);
+                    }
+                });
+                ui.add_enabled(has_rect, egui::Slider::new(&mut angle, -180.0..=180.0).show_value(false));
+                if let Some(rect) = session.rect.as_mut() {
+                    rect.angle_deg = angle;
+                }
+                ComboBox::from_label("Interpolation")
+                    .selected_text(session.interpolation.label())
+                    .show_ui(ui, |ui| {
+                        for mode in Interpolation::ALL {
+                            ui.selectable_value(&mut session.interpolation, mode, mode.label()).on_hover_text("Méthode utilisée pour calculer les pixels de l'image redressée.");
+                        }
+                    });
+                ui.checkbox(&mut session.clamp, "Bridage de l'interpolation")
+                    .on_hover_text("Ramène chaque pixel interpolé entre le minimum et le maximum des pixels du noyau, pour limiter les anneaux.");
+                ui.horizontal(|ui| {
+                    if ui.button("Annuler").on_hover_text("Poursuit l'extraction de fond sur l'image entière, sans recadrage.").clicked() {
+                        decision = Some(CropDecision::Skip);
+                    }
+                    let usable = session.rect.as_ref().is_some_and(rotate_crop::is_usable);
+                    if ui.add_enabled(usable, egui::Button::new("Appliquer")).on_hover_text("Recadre, redresse l'image, puis lance l'extraction de fond.").clicked() {
+                        if let Some(rect) = session.rect {
+                            decision = Some(CropDecision::Apply(Spec { rect, interpolation: session.interpolation, clamp: session.clamp }));
+                        }
+                    }
+                });
+            });
+        if let Some(decision) = decision {
+            self.crop_ui = Some(session);
+            self.finish_crop(decision);
+        } else {
+            self.crop_ui = Some(session);
+        }
     }
 
     fn log_tab(&mut self, ui: &mut egui::Ui) {

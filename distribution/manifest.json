@@ -1,0 +1,40 @@
+{
+  "repo": "Creations-Daniel-Dube/dubGPUStack",
+  "tag": "runtime-1.6.2026",
+  "ortLinux": {
+    "url": "https://github.com/microsoft/onnxruntime/releases/download/v1.31.0/onnxruntime-linux-x64-gpu-1.31.0.tgz",
+    "dest": "onnxruntime/lib"
+  },
+  "windows": [
+    {"asset": "dubGPUStack.exe", "dest": "dubGPUStack.exe", "local": "target/release/dubGPUStack.exe"},
+    {"asset": "dub_noise_rd.wts", "dest": "dubNoise/dub_noise_rd.wts", "local": "dubNoise/dub_noise_rd.wts"},
+    {"asset": "model_v2_5_0.onnx", "dest": "siril/model_v2_5_0.onnx", "local": "siril/model_v2_5_0.onnx"},
+    {"asset": "onnxruntime.dll", "dest": "onnxruntime/onnxruntime.dll", "local": "onnxruntime/onnxruntime.dll"},
+    {"asset": "onnxruntime_providers_cuda.dll", "dest": "onnxruntime/onnxruntime_providers_cuda.dll", "local": "onnxruntime/onnxruntime_providers_cuda.dll"},
+    {"asset": "onnxruntime_providers_shared.dll", "dest": "onnxruntime/onnxruntime_providers_shared.dll", "local": "onnxruntime/onnxruntime_providers_shared.dll"},
+    {"asset": "cublas64_12.dll", "dest": "cublas64_12.dll", "cuda": "cublas64_12.dll"},
+    {"asset": "cublasLt64_12.dll", "dest": "cublasLt64_12.dll", "cuda": "cublasLt64_12.dll"},
+    {"asset": "cudart64_12.dll", "dest": "cudart64_12.dll", "cuda": "cudart64_12.dll"},
+    {"asset": "cudnn64_9.dll", "dest": "cudnn64_9.dll", "cuda": "cudnn64_9.dll"},
+    {"asset": "cufft64_11.dll", "dest": "cufft64_11.dll", "cuda": "cufft64_11.dll"},
+    {"asset": "nvrtc64_120_0.dll", "dest": "nvrtc64_120_0.dll", "cuda": "nvrtc64_120_0.dll"},
+    {"asset": "nvrtc-builtins64_128.dll", "dest": "nvrtc-builtins64_128.dll", "cuda": "nvrtc-builtins64_128.dll"}
+  ],
+  "ubuntu": [
+    {"asset": "dubGPUStack", "dest": "dubGPUStack", "local": "target/release/dubGPUStack"},
+    {"asset": "dub_noise_rd.wts", "dest": "dubNoise/dub_noise_rd.wts", "local": "dubNoise/dub_noise_rd.wts"},
+    {"asset": "model_v2_5_0.onnx", "dest": "siril/model_v2_5_0.onnx", "local": "siril/model_v2_5_0.onnx"},
+    {"asset": "libonnxruntime.so", "dest": "onnxruntime/lib/libonnxruntime.so", "ort": true},
+    {"asset": "libonnxruntime.so.1", "dest": "onnxruntime/lib/libonnxruntime.so.1", "ort": true},
+    {"asset": "libonnxruntime_providers_cuda.so", "dest": "onnxruntime/lib/libonnxruntime_providers_cuda.so", "ort": true},
+    {"asset": "libonnxruntime_providers_shared.so", "dest": "onnxruntime/lib/libonnxruntime_providers_shared.so", "ort": true}
+  ],
+  "ubuntuCuda": [
+    {"name": "libcudart.so.12", "dest": "onnxruntime/lib/libcudart.so.12"},
+    {"name": "libcublas.so.12", "dest": "onnxruntime/lib/libcublas.so.12"},
+    {"name": "libcublasLt.so.12", "dest": "onnxruntime/lib/libcublasLt.so.12"},
+    {"name": "libcudnn.so.9", "dest": "onnxruntime/lib/libcudnn.so.9"},
+    {"name": "libcufft.so.11", "dest": "onnxruntime/lib/libcufft.so.11"},
+    {"name": "libnvrtc.so.12", "dest": "onnxruntime/lib/libnvrtc.so.12"}
+  ]
+}

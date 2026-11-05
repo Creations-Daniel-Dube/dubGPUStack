@@ -4,7 +4,8 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant;
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
@@ -18,6 +19,7 @@ use super::sequence::{self, Frame};
 use super::stack::{self, SampleFrame, SampleSource, StackParams};
 use super::stars::{self, FrameMetrics, StarList};
 use super::stats::{self, FrameStats};
+use super::rotate_crop::{self, Spec};
 use super::stretch;
 use crate::gpu::Gpu;
 
@@ -145,7 +147,27 @@ pub struct RunOutput {
     pub display_ready: bool,
 }
 
-pub fn run(cfg: &JobConfig, cancel: &AtomicBool, mut emit: impl FnMut(Event)) -> Result<RunOutput, String> {
+/// Aperçu étiré envoyé à l'interface pour dessiner le rectangle.
+pub struct CropPause {
+    pub rgba: Vec<u8>,
+    pub preview_w: usize,
+    pub preview_h: usize,
+    pub width: usize,
+    pub height: usize,
+}
+
+pub enum CropDecision {
+    Skip,
+    Apply(Spec),
+}
+
+/// L'interface reçoit `CropPause` et répond par `CropDecision`. Absent en ligne de commande.
+pub struct CropGate {
+    pub pause_tx: mpsc::Sender<CropPause>,
+    pub decision_rx: mpsc::Receiver<CropDecision>,
+}
+
+pub fn run(cfg: &JobConfig, cancel: &AtomicBool, crop: Option<&CropGate>, mut emit: impl FnMut(Event)) -> Result<RunOutput, String> {
     let started = std::time::Instant::now();
     cfg.validate()?;
     if writes_products(cfg) {
@@ -160,15 +182,15 @@ pub fn run(cfg: &JobConfig, cancel: &AtomicBool, mut emit: impl FnMut(Event)) ->
     emit(Event::Log { level: "info".into(), message: info.summary() });
     let budget = stack::memory_budget(cfg.gpu_mem_gib, info.free, info.total);
     let mut output = if cfg.lights_dir.is_empty() {
-        run_sequence(cfg, &gpu, budget, info.free, info.total, cancel, &mut emit)?
+        run_sequence(cfg, &gpu, budget, info.free, info.total, cancel, crop, &mut emit)?
     } else {
-        run_lights(cfg, &gpu, budget, info.free, info.total, cancel, &mut emit)?
+        run_lights(cfg, &gpu, budget, info.free, info.total, cancel, crop, &mut emit)?
     };
     output.elapsed = started.elapsed().as_secs_f64();
     Ok(output)
 }
 
-fn run_sequence(cfg: &JobConfig, gpu: &Gpu, budget: usize, free: usize, total: usize, cancel: &AtomicBool, emit: &mut impl FnMut(Event)) -> Result<RunOutput, String> {
+fn run_sequence(cfg: &JobConfig, gpu: &Gpu, budget: usize, free: usize, total: usize, cancel: &AtomicBool, crop: Option<&CropGate>, emit: &mut impl FnMut(Event)) -> Result<RunOutput, String> {
     let seq = sequence::parse_seq(Path::new(&cfg.seq_path))?;
     let problems = sequence::check_stackable(&seq);
     if !problems.is_empty() {
@@ -276,10 +298,10 @@ fn run_sequence(cfg: &JobConfig, gpu: &Gpu, budget: usize, free: usize, total: u
             source: SampleSource::Shift { path: seq.frame_path(frame), weight: if use_drizzle { Some(seq.drizzle_path(frame)) } else { None } },
         });
     }
-    finish_stack(cfg, gpu, budget, free, total, cancel, emit, samples, seq.layers, (x0, y0, x1, y1), &seq.frame_path(&ref_frame), &frames.iter().map(|frame| sequence::read_frame_meta(&seq.frame_path(frame))).collect::<Vec<_>>())
+    finish_stack(cfg, gpu, budget, free, total, cancel, crop, emit, samples, seq.layers, (x0, y0, x1, y1), &seq.frame_path(&ref_frame), &frames.iter().map(|frame| sequence::read_frame_meta(&seq.frame_path(frame))).collect::<Vec<_>>())
 }
 
-fn run_lights(cfg: &JobConfig, gpu: &Gpu, budget: usize, free: usize, total: usize, cancel: &AtomicBool, emit: &mut impl FnMut(Event)) -> Result<RunOutput, String> {
+fn run_lights(cfg: &JobConfig, gpu: &Gpu, budget: usize, free: usize, total: usize, cancel: &AtomicBool, crop: Option<&CropGate>, emit: &mut impl FnMut(Event)) -> Result<RunOutput, String> {
     let folder = lights::find_lights_dir(Path::new(&cfg.lights_dir));
     let mut lights = lights::scan_lights(&folder);
     if let Some(names) = &cfg.include_files {
@@ -494,10 +516,10 @@ fn run_lights(cfg: &JobConfig, gpu: &Gpu, budget: usize, free: usize, total: usi
         _ => None,
     }).collect();
     let _ = adapted;
-    finish_stack(cfg, gpu, budget, free, total, cancel, emit, samples, layers, (x0, y0, x1, y1), &ref_light.path, &metas)
+    finish_stack(cfg, gpu, budget, free, total, cancel, crop, emit, samples, layers, (x0, y0, x1, y1), &ref_light.path, &metas)
 }
 
-fn finish_stack(cfg: &JobConfig, gpu: &Gpu, budget: usize, free: usize, total: usize, cancel: &AtomicBool, emit: &mut impl FnMut(Event), samples: Vec<SampleFrame>, channels: usize, region: (i32, i32, i32, i32), reference: &Path, metas: &[sequence::FrameMeta]) -> Result<RunOutput, String> {
+fn finish_stack(cfg: &JobConfig, gpu: &Gpu, budget: usize, free: usize, total: usize, cancel: &AtomicBool, crop: Option<&CropGate>, emit: &mut impl FnMut(Event), samples: Vec<SampleFrame>, channels: usize, region: (i32, i32, i32, i32), reference: &Path, metas: &[sequence::FrameMeta]) -> Result<RunOutput, String> {
     if cfg.rows.is_none() && !cfg.output_path.is_empty() && !cfg.overwrite {
         if let Some(found) = planned_outputs(Path::new(&cfg.output_path), cfg.denoise, cfg.save_coverage).into_iter().find(|path| path.exists()) {
             return Err(format!("{} existe déjà", found.display()));
@@ -563,7 +585,7 @@ fn finish_stack(cfg: &JobConfig, gpu: &Gpu, budget: usize, free: usize, total: u
     };
     let ext = fits_extension(&base);
     let stack_path = step_path(&base, "_postStack", &ext);
-    let cards = output_cards(cfg, reference, samples.len(), metas, stacked.width, stacked.height);
+    let mut cards = output_cards(cfg, reference, samples.len(), metas, stacked.width, stacked.height);
     emit(Event::Progress { phase: "Écriture FITS".into(), done: total_rows, total: total_rows, detail: stack_path.display().to_string() });
     fits::write_fits(&stack_path, &data, stacked.channels, stacked.height, stacked.width, &cards)?;
     emit(Event::Log { level: "ok".into(), message: format!("écrit {}", stack_path.display()) });
@@ -574,56 +596,63 @@ fn finish_stack(cfg: &JobConfig, gpu: &Gpu, budget: usize, free: usize, total: u
         emit(Event::Log { level: "ok".into(), message: format!("écrit {}", cov_path.display()) });
     }
     emit(Event::Progress { phase: "Stretch HyperMetric".into(), done: 0.0, total: 1.0, detail: stack_path.display().to_string() });
-    let mut stretched = stretch::auto_stretch_hypermetric(&data, stacked.channels, stacked.height, stacked.width);
+    let stretched = stretch::auto_stretch_hypermetric(&data, stacked.channels, stacked.height, stacked.width);
     drop(data);
     let stretch_path = step_path(&base, "_stretch", &ext);
     emit(Event::Progress { phase: "Écriture FITS".into(), done: total_rows, total: total_rows, detail: stretch_path.display().to_string() });
     fits::write_fits(&stretch_path, &stretched.image, stacked.channels, stacked.height, stacked.width, &cards)?;
     emit(Event::Log { level: "ok".into(), message: format!("écrit {}", stretch_path.display()) });
+    let log_d = stretched.log_d;
+    let mut image = stretched.image;
+    let mut out_w = stacked.width;
+    let mut out_h = stacked.height;
+    if let Some(gate) = crop {
+        offer_crop(&mut image, stacked.channels, &mut out_h, &mut out_w, &mut cards, gate, cancel, emit)?;
+    }
     emit(Event::Progress { phase: "Extraction de fond".into(), done: 0.0, total: 4.0, detail: stretch_path.display().to_string() });
-    crate::engine::bge::apply(&mut stretched.image, stacked.channels, stacked.height, stacked.width, cancel, |done, total| {
+    crate::engine::bge::apply(&mut image, stacked.channels, out_h, out_w, cancel, |done, total| {
         emit(Event::Progress { phase: "Extraction de fond".into(), done, total, detail: String::new() });
     })?;
     let bge_path = step_path(&base, "_BGE", &ext);
     emit(Event::Progress { phase: "Écriture FITS".into(), done: total_rows, total: total_rows, detail: bge_path.display().to_string() });
-    fits::write_fits(&bge_path, &stretched.image, stacked.channels, stacked.height, stacked.width, &cards)?;
+    fits::write_fits(&bge_path, &image, stacked.channels, out_h, out_w, &cards)?;
     emit(Event::Log { level: "ok".into(), message: format!("écrit {}", bge_path.display()) });
     emit(Event::Progress { phase: "Aberrations".into(), done: 0.0, total: 1.0, detail: "tuile 0".into() });
-    let aberrations = crate::engine::aberration::apply(&mut stretched.image, stacked.channels, stacked.height, stacked.width, cancel, |done, total| {
+    let aberrations = crate::engine::aberration::apply(&mut image, stacked.channels, out_h, out_w, cancel, |done, total| {
         emit(Event::Progress { phase: "Aberrations".into(), done: done as f64, total: total as f64, detail: format!("tuile {done}/{total}") });
     })?;
     emit(Event::Log { level: "ok".into(), message: format!("aberrations {}, {} tuiles en {:.1} s", aberrations.device, aberrations.tiles, aberrations.seconds) });
     let ab_path = step_path(&base, "_AB", &ext);
     emit(Event::Progress { phase: "Écriture FITS".into(), done: total_rows, total: total_rows, detail: ab_path.display().to_string() });
-    fits::write_fits(&ab_path, &stretched.image, stacked.channels, stacked.height, stacked.width, &cards)?;
+    fits::write_fits(&ab_path, &image, stacked.channels, out_h, out_w, &cards)?;
     emit(Event::Log { level: "ok".into(), message: format!("écrit {}", ab_path.display()) });
     let display_suffix = if cfg.denoise {
-        let tiles = crate::engine::denoise::tile_count_hint(stretched.image.len(), stacked.channels, stacked.height, stacked.width);
+        let tiles = crate::engine::denoise::tile_count_hint(image.len(), stacked.channels, out_h, out_w);
         emit(Event::Progress { phase: "Débruitage".into(), done: 0.0, total: tiles as f64, detail: format!("tuile 0/{tiles}") });
-        let report = crate::engine::denoise::apply(gpu, &mut stretched.image, stacked.channels, stacked.height, stacked.width, cancel, |done, total| {
+        let report = crate::engine::denoise::apply(gpu, &mut image, stacked.channels, out_h, out_w, cancel, |done, total| {
             emit(Event::Progress { phase: "Débruitage".into(), done: done as f64, total: total as f64, detail: format!("tuile {done}/{total}") });
         })?;
         emit(Event::Log { level: "ok".into(), message: format!("Prism Mini, {} tuiles en {:.1} s", report.tiles, report.seconds) });
         let dn_path = step_path(&base, "_DN", &ext);
         emit(Event::Progress { phase: "Écriture FITS".into(), done: total_rows, total: total_rows, detail: dn_path.display().to_string() });
-        fits::write_fits(&dn_path, &stretched.image, stacked.channels, stacked.height, stacked.width, &cards)?;
+        fits::write_fits(&dn_path, &image, stacked.channels, out_h, out_w, &cards)?;
         emit(Event::Log { level: "ok".into(), message: format!("écrit {}", dn_path.display()) });
         "_DN"
     } else {
         "_AB"
     };
     let [png8, png16, tiff] = display_paths(&base, display_suffix);
-    export::write_png(&png8, &stretched.image, stacked.channels, stacked.height, stacked.width, false)?;
-    export::write_png(&png16, &stretched.image, stacked.channels, stacked.height, stacked.width, true)?;
-    export::write_tiff32(&tiff, &stretched.image, stacked.channels, stacked.height, stacked.width)?;
-    let (preview, preview_h, preview_w) = stack::bin_preview(&stretched.image, stacked.channels, stacked.height, stacked.width, factor);
-    emit(Event::Progress { phase: "Stretch HyperMetric".into(), done: 1.0, total: 1.0, detail: format!("Log D {:.2}", stretched.log_d) });
+    export::write_png(&png8, &image, stacked.channels, out_h, out_w, false)?;
+    export::write_png(&png16, &image, stacked.channels, out_h, out_w, true)?;
+    export::write_tiff32(&tiff, &image, stacked.channels, out_h, out_w)?;
+    let shown = (out_w / 960).max(1);
+    let (preview, preview_h, preview_w) = stack::bin_preview(&image, stacked.channels, out_h, out_w, shown);
+    emit(Event::Progress { phase: "Stretch HyperMetric".into(), done: 1.0, total: 1.0, detail: format!("Log D {log_d:.2}") });
     emit(Event::Log { level: "ok".into(), message: format!("terminé en {elapsed:.1} s · {}", stack_path.display()) });
     emit(Event::Log {
         level: "ok".into(),
         message: format!(
-            "HyperMetric Log D = {:.2} · {} · {} · {} · {} · {} · {}",
-            stretched.log_d,
+            "HyperMetric Log D = {log_d:.2} · {} · {} · {} · {} · {} · {}",
             stretch_path.display(),
             bge_path.display(),
             ab_path.display(),
@@ -632,7 +661,55 @@ fn finish_stack(cfg: &JobConfig, gpu: &Gpu, budget: usize, free: usize, total: u
             tiff.display()
         ),
     });
-    Ok(RunOutput { path: stack_path.display().to_string(), frames: samples.len(), low: stacked.rejected_low, high: stacked.rejected_high, width: stacked.width, height: stacked.height, channels: stacked.channels, elapsed, preview, preview_w, preview_h, display_ready: true })
+    Ok(RunOutput { path: stack_path.display().to_string(), frames: samples.len(), low: stacked.rejected_low, high: stacked.rejected_high, width: out_w, height: out_h, channels: stacked.channels, elapsed, preview, preview_w, preview_h, display_ready: true })
+}
+
+fn offer_crop(image: &mut Vec<f32>, channels: usize, height: &mut usize, width: &mut usize, cards: &mut Vec<String>, gate: &CropGate, cancel: &AtomicBool, emit: &mut impl FnMut(Event)) -> Result<(), String> {
+    emit(Event::Progress { phase: "Recadrage".into(), done: 0.0, total: 1.0, detail: "en attente".into() });
+    let pause = crop_pause(image, channels, *height, *width);
+    if gate.pause_tx.send(pause).is_err() {
+        emit(Event::Log { level: "info".into(), message: "recadrage non appliqué".into() });
+        return Ok(());
+    }
+    match wait_crop(gate, cancel)? {
+        CropDecision::Skip => {
+            emit(Event::Log { level: "info".into(), message: "recadrage non appliqué".into() });
+            Ok(())
+        }
+        CropDecision::Apply(spec) => {
+            emit(Event::Progress { phase: "Recadrage".into(), done: 0.0, total: 1.0, detail: "application".into() });
+            let (cropped, new_h, new_w) = rotate_crop::apply(image, channels, *height, *width, &spec, cancel)?;
+            *image = cropped;
+            *height = new_h;
+            *width = new_w;
+            cards.extend(fits::history(&format!(
+                "rotate-crop {:.2} deg {}x{} center {:.1} {:.1} {}",
+                spec.rect.angle_deg, new_w, new_h, spec.rect.center_x, spec.rect.center_y, spec.interpolation.history_name()
+            )));
+            emit(Event::Log { level: "info".into(), message: format!("recadrage {:.2}° · {}×{}", spec.rect.angle_deg, new_w, new_h) });
+            Ok(())
+        }
+    }
+}
+
+fn crop_pause(image: &[f32], channels: usize, height: usize, width: usize) -> CropPause {
+    let factor = width.max(height).div_ceil(2048).max(1);
+    let (preview, preview_h, preview_w) = stack::bin_preview(image, channels, height, width, factor);
+    let rgba = stretch::unit_rgba(&preview, channels, preview_h, preview_w);
+    CropPause { rgba, preview_w, preview_h, width, height }
+}
+
+fn wait_crop(gate: &CropGate, cancel: &AtomicBool) -> Result<CropDecision, String> {
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            return Err("cancelled".to_string());
+        }
+        match gate.decision_rx.recv_timeout(Duration::from_millis(50)) {
+            Ok(decision) => return Ok(decision),
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => return Ok(CropDecision::Skip),
+        }
+    }
 }
 
 pub fn fits_extension(base: &Path) -> String {
