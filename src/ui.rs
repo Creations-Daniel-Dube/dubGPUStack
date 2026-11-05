@@ -727,7 +727,7 @@ impl App {
                 };
                 ui.label(if self.output_path.is_empty() { "Nom automatique".to_string() } else { short_path(&self.output_path) }).on_hover_text(name_tip);
                 ui.checkbox(&mut self.settings.save_coverage, "Carte de couverture").on_hover_text("Écrit aussi la carte du nombre d'images par pixel, avec le suffixe _coverage.");
-                ui.checkbox(&mut self.settings.denoise, "Débruitage Prism Mini").on_hover_text("Après le FITS _stretch, retire le bruit puis écrit le FITS _DN. Le FITS linéaire _postStack reste inchangé. Réglages figés : force 90 %, tuile 512, recouvrement 96.");
+                ui.checkbox(&mut self.settings.denoise, "Débruitage dubNoise").on_hover_text("Après le FITS _stretch, retire le bruit puis écrit le FITS _DN. Le FITS linéaire _postStack reste inchangé. Réglages figés : force 90 %, tuile 512, recouvrement 96.");
             });
             advanced_toggle(ui, &mut self.advanced_open);
             if self.advanced_open {
