@@ -128,6 +128,8 @@ impl JobConfig {
 pub enum Event {
     Log { level: String, message: String },
     Progress { phase: String, done: f64, total: f64, detail: String },
+    /// Aperçu 8 bits déjà étiré, à afficher sans attendre la fin du traitement.
+    Preview { rgba: Vec<u8>, width: usize, height: usize },
 }
 
 #[derive(Clone, Debug)]
@@ -686,6 +688,8 @@ fn offer_crop(image: &mut Vec<f32>, channels: usize, height: &mut usize, width: 
                 "rotate-crop {:.2} deg {}x{} center {:.1} {:.1} {}",
                 spec.rect.angle_deg, new_w, new_h, spec.rect.center_x, spec.rect.center_y, spec.interpolation.history_name()
             )));
+            let shown = crop_pause(image, channels, *height, *width);
+            emit(Event::Preview { rgba: shown.rgba, width: shown.preview_w, height: shown.preview_h });
             emit(Event::Log { level: "info".into(), message: format!("recadrage {:.2}° · {}×{}", spec.rect.angle_deg, new_w, new_h) });
             Ok(())
         }

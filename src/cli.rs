@@ -140,6 +140,7 @@ fn run_stack(cfg: JobConfig) -> i32 {
     match job::run(&cfg, &cancel, None, |event| match event {
         Event::Log { level, message } => println(&format!("[{level}] {message}")),
         Event::Progress { phase, done, total, detail } => println(&format!("{phase} {done:.0}/{total:.0} {detail}")),
+        Event::Preview { .. } => {}
     }) {
         Ok(output) => {
             if !output.path.is_empty() {

@@ -62,6 +62,17 @@ pub fn is_usable(rect: &Rect) -> bool {
         && rect.height >= 8.0
 }
 
+/// Vrai si le point, en coordonnées de bord, est dans le rectangle, bords compris.
+pub fn contains(rect: &Rect, x: f64, y: f64) -> bool {
+    let dx = x - rect.center_x;
+    let dy = y - rect.center_y;
+    let radians = rect.angle_deg.to_radians();
+    let (sin, cos) = (radians.sin(), radians.cos());
+    let lx = dx * cos + dy * sin;
+    let ly = -dx * sin + dy * cos;
+    lx.abs() <= rect.width / 2.0 && ly.abs() <= rect.height / 2.0
+}
+
 /// Coins dans l'ordre haut-gauche, haut-droite, bas-droite, bas-gauche du rectangle tourné.
 pub fn corners(rect: &Rect) -> [[f64; 2]; 4] {
     let hw = rect.width / 2.0;
@@ -356,6 +367,17 @@ mod tests {
         assert!((rect.width - 24.0).abs() < 1e-6);
         assert!((rect.center_x - 10.0).abs() < 1e-6);
         assert!((rect.center_y - 12.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn interior_follows_the_rotated_rectangle() {
+        let rect = Rect { center_x: 10.0, center_y: 10.0, width: 20.0, height: 10.0, angle_deg: 0.0 };
+        assert!(contains(&rect, 10.0, 10.0));
+        assert!(contains(&rect, 19.0, 14.0));
+        assert!(!contains(&rect, 10.0, 16.0));
+        let turned = Rect { angle_deg: 90.0, ..rect };
+        assert!(contains(&turned, 10.0, 18.0));
+        assert!(!contains(&turned, 18.0, 10.0));
     }
 
     #[test]

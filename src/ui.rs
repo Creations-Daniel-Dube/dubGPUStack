@@ -61,6 +61,7 @@ struct Loaded {
 enum Note {
     Log(String, String),
     Progress(String, f64, f64, String),
+    Preview(Vec<u8>, usize, usize),
     Finished(Result<RunOutput, String>),
 }
 
@@ -78,6 +79,7 @@ struct CropUi {
 enum CropDrag {
     None,
     Draw { start: [f64; 2] },
+    Move { origin: rotate_crop::Rect, press: [f64; 2] },
     Edge { edge: usize, origin: rotate_crop::Rect, press: [f64; 2] },
 }
 
@@ -200,6 +202,7 @@ impl App {
                     self.phase = format!("{phase} · {detail}");
                     self.fraction = if total > 0.0 { (done / total) as f32 } else { 0.0 };
                 }
+                Note::Preview(rgba, width, height) => self.show_rgba(ctx, &rgba, width, height),
                 Note::Finished(result) => {
                     again = false;
                     self.busy = false;
@@ -260,6 +263,14 @@ impl App {
         self.tab = Tab::Result;
         self.phase = "Recadrage · dessinez la zone à garder".into();
         self.fraction = 0.0;
+    }
+
+    fn show_rgba(&mut self, ctx: &egui::Context, rgba: &[u8], width: usize, height: usize) {
+        if width == 0 || height == 0 || rgba.len() < width * height * 4 {
+            return;
+        }
+        let image = egui::ColorImage::from_rgba_unmultiplied([width, height], rgba);
+        self.preview = Some(ctx.load_texture("apercu", image, egui::TextureOptions::LINEAR));
     }
 
     fn finish_crop(&mut self, decision: CropDecision) {
@@ -345,6 +356,21 @@ impl App {
             self.output_path = path.display().to_string();
             self.confirm = false;
             self.push("info", &format!("nom de sortie {}", short_path(&self.output_path)));
+        }
+    }
+
+    fn open_saved_images_folder(&mut self) {
+        let dir = if !self.result_path.is_empty() {
+            Path::new(&self.result_path).parent().map(Path::to_path_buf)
+        } else if !self.output_path.is_empty() {
+            Path::new(&self.output_path).parent().map(Path::to_path_buf)
+        } else {
+            None
+        };
+        if let Some(dir) = dir.filter(|path| path.is_dir()) {
+            let _ = std::process::Command::new("explorer").arg(dir).spawn();
+        } else {
+            self.push("warn", "aucune image générée à montrer");
         }
     }
 
@@ -688,6 +714,7 @@ impl App {
                     let note = match event {
                         Event::Log { level, message } => Note::Log(level, message),
                         Event::Progress { phase, done, total, detail } => Note::Progress(phase, done, total, detail),
+                        Event::Preview { rgba, width, height } => Note::Preview(rgba, width, height),
                     };
                     let _ = tx_job.send(note);
                 })
@@ -731,7 +758,7 @@ impl App {
 
     fn ui_bar(&mut self, ui: &mut egui::Ui) {
         egui::MenuBar::new().ui(ui, |ui| {
-            ui.menu_button("Fichier", |ui| {
+            ui.menu_button("Fichiers", |ui| {
                 if ui.button("Ouvrir un dossier de brutes…").on_hover_text("Ouvre un dossier d'images brutes.").clicked() {
                     if let Some(path) = rfd::FileDialog::new().set_directory(&self.settings.last_dir).pick_folder() {
                         self.open_path(&path);
@@ -763,6 +790,17 @@ impl App {
                 if ui.button("Empiler").on_hover_text("Empile les images sélectionnées. Écrit le FITS _postStack, puis _stretch. Le calcul s'arrête pour recadrer et redresser, puis enchaîne _BGE, _AB et, si le débruitage est actif, _DN.").clicked() { self.start(false, false); ui.close(); }
                 if ui.button("Quitter").on_hover_text("Ferme dubGPUStack.").clicked() { ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close); }
             }).response.on_hover_text("Ouvrir, recharger ou quitter.");
+            ui.menu_button("Images finales", |ui| {
+                if ui.button("Voir répertoire").on_hover_text("Ouvre le dossier où les images générées ont été enregistrées.").clicked() {
+                    self.open_saved_images_folder();
+                    ui.close();
+                }
+            }).response.on_hover_text("Dossier des images générées.");
+            ui.menu_button("Aides", |ui| {
+                if ui.button("À propos de...").on_hover_text("À propos de dubGPUStack.").clicked() {
+                    ui.close();
+                }
+            }).response.on_hover_text("Aide et informations.");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.label(RichText::new(&self.gpu_line).small());
             });
@@ -1243,7 +1281,7 @@ fn panic_text(payload: Box<dyn std::any::Any + Send>) -> String {
 impl App {
     fn result_tab(&mut self, ui: &mut egui::Ui) {
         if self.crop_ui.is_some() {
-            ui.label("Tracez un rectangle, faites-le tourner, puis Appliquer.").on_hover_text("Le rectangle rouge est la zone gardée. L'image résultante est redressée, sans bandes noires.");
+            ui.label("Tracez un rectangle. Glissez l'intérieur pour le déplacer, un bord pour le redimensionner.").on_hover_text("Le rectangle rouge est la zone gardée. L'image résultante est redressée, sans bandes noires.");
             self.crop_canvas(ui);
             return;
         }
@@ -1282,6 +1320,8 @@ impl App {
                     let edge_hit = session.rect.and_then(|rect| hit_edge(pos, &rect, image_rect, session.full_w, session.full_h).map(|edge| (edge, rect)));
                     if let Some((edge, origin)) = edge_hit {
                         session.drag = CropDrag::Edge { edge, origin, press: full };
+                    } else if let Some(origin) = session.rect.filter(|rect| rotate_crop::contains(rect, full[0], full[1])) {
+                        session.drag = CropDrag::Move { origin, press: full };
                     } else {
                         session.rect = None;
                         session.drag = CropDrag::Draw { start: full };
@@ -1305,6 +1345,12 @@ impl App {
                             height: (y1 - y0).abs(),
                             angle_deg: 0.0,
                         });
+                    }
+                    CropDrag::Move { origin, press } => {
+                        let mut moved = origin;
+                        moved.center_x = origin.center_x + full[0] - press[0];
+                        moved.center_y = origin.center_y + full[1] - press[1];
+                        session.rect = Some(moved);
                     }
                     CropDrag::Edge { edge, origin, press } => {
                         let normal = rotate_crop::outward_normal(&origin, edge);
@@ -1334,9 +1380,14 @@ impl App {
             }
         }
         if let Some(pos) = response.hover_pos() {
-            let cursor = if let Some(rect) = session.rect.as_ref() {
+            let cursor = if matches!(session.drag, CropDrag::Move { .. }) {
+                Some(egui::CursorIcon::Grabbing)
+            } else if let Some(rect) = session.rect.as_ref() {
+                let full = screen_to_full(pos, image_rect, session.full_w, session.full_h);
                 if let Some(edge) = hit_edge(pos, rect, image_rect, session.full_w, session.full_h) {
                     Some(cursor_for_normal(rotate_crop::outward_normal(rect, edge)))
+                } else if rotate_crop::contains(rect, full[0], full[1]) {
+                    Some(egui::CursorIcon::Grab)
                 } else if image_rect.contains(pos) {
                     Some(egui::CursorIcon::Crosshair)
                 } else {
