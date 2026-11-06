@@ -2,7 +2,7 @@
   "repo": "Creations-Daniel-Dube/dubGPUStack",
   "tag": "runtime-1.6.2026",
   "ortLinux": {
-    "url": "https://github.com/microsoft/onnxruntime/releases/download/v1.31.0/onnxruntime-linux-x64-gpu-1.31.0.tgz",
+    "url": "https://github.com/microsoft/onnxruntime/releases/download/v1.31.0/onnxruntime-linux-x64-gpu_cuda12-1.31.0.tgz",
     "dest": "onnxruntime/lib"
   },
   "windows": [
