@@ -122,6 +122,7 @@ pub struct App {
     crop_reply: Option<mpsc::Sender<CropDecision>>,
     crop_ui: Option<CropUi>,
     advanced_open: bool,
+    about_open: bool,
     job_started: Option<std::time::Instant>,
     job_clock: String,
     open_at_start: Option<String>,
@@ -164,6 +165,7 @@ impl App {
             crop_reply: None,
             crop_ui: None,
             advanced_open: false,
+            about_open: false,
             job_started: None,
             job_clock: String::new(),
             open_at_start: open,
@@ -435,7 +437,7 @@ impl App {
         if self.output_path.is_empty() {
             return None;
         }
-        job::planned_outputs(Path::new(&self.output_path), self.settings.denoise, self.settings.save_coverage, !self.settings.small_nebula)
+        job::planned_outputs(Path::new(&self.output_path), self.settings.denoise, self.settings.green_noise, self.settings.save_coverage, !self.settings.small_nebula)
             .into_iter()
             .find(|path| path.exists())
             .map(|path| path.display().to_string())
@@ -659,6 +661,7 @@ impl App {
             pixfrac: self.settings.pixfrac,
             transform: self.settings.transform.clone(),
             denoise: self.settings.denoise && rows.is_none() && !analyze_only,
+            green_noise: self.settings.green_noise && rows.is_none() && !analyze_only,
             small_nebula: self.settings.small_nebula,
             analyze_only,
         };
@@ -825,6 +828,7 @@ impl App {
             }).response.on_hover_text("Dossier des images générées.");
             ui.menu_button("Aides", |ui| {
                 if ui.button("À propos de...").on_hover_text("À propos de dubGPUStack.").clicked() {
+                    self.about_open = true;
                     ui.close();
                 }
             }).response.on_hover_text("Aide et informations.");
@@ -863,18 +867,19 @@ impl App {
                 });
             }
             group(ui, "Sortie", |ui| {
-                if ui.button("Choisir le fichier de sortie…").on_hover_text("Change le nom de base. Chaque enregistrement ajoute le suffixe de l'étape : _postStack, _stretch, _BGE, _AB, _DN.").clicked() {
+                if ui.button("Choisir le fichier de sortie…").on_hover_text("Change le nom de base. Chaque enregistrement ajoute le suffixe de l'étape : _postStack, _stretch, _BGE, _SCNR, _AB, _DN.").clicked() {
                     self.ask_output_name();
                 }
                 let name_tip = if self.output_path.is_empty() {
-                    "Sans nom choisi, un nom automatique est créé à l'empilement. Les fichiers reçoivent _postStack, _stretch, _BGE, _AB et, si le débruitage est actif, _DN. Petite Nébuleuse retire _AB."
+                    "Sans nom choisi, un nom automatique est créé à l'empilement. Les fichiers reçoivent _postStack, _stretch, _BGE, éventuellement _SCNR, _AB et, si le débruitage est actif, _DN. Petite Nébuleuse retire _AB."
                 } else {
-                    "Nom de base, sans suffixe. L'empilement écrit ce nom avec _postStack, _stretch, _BGE, _AB et, si le débruitage est actif, _DN. Petite Nébuleuse retire _AB."
+                    "Nom de base, sans suffixe. L'empilement écrit ce nom avec _postStack, _stretch, _BGE, éventuellement _SCNR, _AB et, si le débruitage est actif, _DN. Petite Nébuleuse retire _AB."
                 };
                 ui.label(if self.output_path.is_empty() { "Nom automatique".to_string() } else { short_path(&self.output_path) }).on_hover_text(name_tip);
             });
             group(ui, "Optionnels", |ui| {
                 ui.checkbox(&mut self.settings.denoise, "Débruitage dubNoise").on_hover_text("Retire le bruit de la dernière image et écrit le FITS _DN. Il part des aberrations, ou de l'extraction de fond si Petite Nébuleuse est cochée. Réglages figés : force 90 %, tuile 512, recouvrement 96.");
+                ui.checkbox(&mut self.settings.green_noise, "Bruit vert").on_hover_text("Après l'extraction de fond, avant les aberrations. Retire le grain vert du fond (neutre (R+B)/2). Les zones au-dessus du fond sont protégées. La luminance est conservée. Écrit le FITS _SCNR.");
                 ui.checkbox(&mut self.settings.small_nebula, "Petite Nébuleuse").on_hover_text("Saute la correction d'aberrations. Une petite nébuleuse comme M57 garde son anneau. Le débruitage, s'il est coché, part de l'extraction de fond.");
             });
             advanced_toggle(ui, &mut self.advanced_open);
@@ -1220,6 +1225,7 @@ impl eframe::App for App {
             Tab::Log => self.log_tab(ui),
         });
         self.crop_window(&ctx);
+        self.about_window(&ctx);
         if self.busy {
             ctx.request_repaint();
         } else {
@@ -1495,6 +1501,51 @@ impl App {
         }
     }
 
+    fn about_window(&mut self, ctx: &egui::Context) {
+        const CREDITS: &[(&str, &str)] = &[
+            ("Aberration Remover 1.1.4", "Riccardo Alberghi, GPL-3.0-or-later. Modèle ONNX, ONNX Runtime (CUDA, sinon processeur)."),
+            ("Prism Mini", "SyQon. Édition gratuite et légère du débruitage neuronal DeepPrism, appliquée à l’image déjà étirée."),
+            ("VeraLux HyperMetric Stretch 1.5.2", "Riccardo Paterniti, GPL-3.0-or-later."),
+            ("AutoBGE 2.0.2", "Adrian Knagg-Baugh, d’après SetiAstro / Franklin Marek, GPL-3.0-or-later."),
+            ("Siril", "Statistiques (médiane, IKSSlite, bruit de fond), séquences .seq, rejet de pixels porté de Siril 1.4.4."),
+        ];
+        let accent = Color32::from_rgb(0xff, 0x93, 0x20);
+        let text = Color32::from_rgb(0xff, 0xe1, 0x4d);
+        egui::Window::new("À propos de dubGPUStack")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .open(&mut self.about_open)
+            .show(ctx, |ui| {
+                ui.set_min_width(720.0);
+                ui.set_max_width(760.0);
+                ui.spacing_mut().item_spacing.y = 4.0;
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("dubGPUStack").size(22.0).color(accent));
+                    ui.label(RichText::new(format!("v{}", job::VERSION)).color(text));
+                });
+                ui.label(RichText::new("Développé par Daniel Dubé.").color(text));
+                about_block(ui, "Le logiciel", |ui| {
+                    ui.label(RichText::new("dubGPUStack est entièrement gratuit.").color(text));
+                    ui.add_space(6.0);
+                    ui.label(RichText::new("Il s’adresse aux personnes moins à l’aise avec les logiciels d’astrophotographie plus complexes : les étapes essentielles sont déjà réglées, pour aligner, empiler et éclaircir les photos du ciel sans avoir à tout configurer.").color(text));
+                    ui.add_space(8.0);
+                    ui.label(RichText::new("Publié sous la licence libre GPL-3.0-or-later.").color(accent));
+                });
+                about_block(ui, "Travaux repris", |ui| {
+                    for (index, (name, detail)) in CREDITS.iter().enumerate() {
+                        if index > 0 {
+                            ui.add_space(4.0);
+                            ui.separator();
+                            ui.add_space(4.0);
+                        }
+                        ui.label(RichText::new(*name).color(accent));
+                        ui.label(RichText::new(*detail).color(text));
+                    }
+                });
+            });
+    }
+
     fn log_tab(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             if ui.button("Effacer").on_hover_text("Vide le journal.").clicked() { self.log.clear(); }
@@ -1574,6 +1625,22 @@ fn advanced_toggle(ui: &mut egui::Ui, open: &mut bool) {
     if clicked {
         *open = !*open;
     }
+}
+
+fn about_block(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui)) {
+    let accent = Color32::from_rgb(0xff, 0x93, 0x20);
+    ui.add_space(14.0);
+    ui.label(RichText::new(title).strong().color(accent));
+    ui.add_space(4.0);
+    Frame::NONE
+        .fill(Color32::from_rgb(0x3d, 0x12, 0x10))
+        .stroke(Stroke::new(1.0, Color32::from_rgb(0x8e, 0x32, 0x24)))
+        .inner_margin(12.0)
+        .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            ui.spacing_mut().item_spacing.y = 2.0;
+            add(ui);
+        });
 }
 
 fn group(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui)) {

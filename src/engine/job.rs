@@ -54,6 +54,8 @@ pub struct JobConfig {
     pub pixfrac: f64,
     pub transform: String,
     pub denoise: bool,
+    /// Cochée, retire le grain vert du fond après l'extraction de fond.
+    pub green_noise: bool,
     /// Cochée, la correction d'aberrations est sautée. Une petite nébuleuse comme M57 garde son anneau.
     pub small_nebula: bool,
     pub analyze_only: bool,
@@ -88,6 +90,7 @@ impl Default for JobConfig {
             pixfrac: 1.0,
             transform: "affine".to_string(),
             denoise: false,
+            green_noise: false,
             small_nebula: false,
             analyze_only: false,
         }
@@ -528,7 +531,7 @@ fn run_lights(cfg: &JobConfig, gpu: &Gpu, budget: usize, free: usize, total: usi
 
 fn finish_stack(cfg: &JobConfig, gpu: &Gpu, budget: usize, free: usize, total: usize, cancel: &AtomicBool, crop: Option<&CropGate>, emit: &mut impl FnMut(Event), samples: Vec<SampleFrame>, channels: usize, region: (i32, i32, i32, i32), reference: &Path, metas: &[sequence::FrameMeta]) -> Result<RunOutput, String> {
     if cfg.rows.is_none() && !cfg.output_path.is_empty() && !cfg.overwrite {
-        if let Some(found) = planned_outputs(Path::new(&cfg.output_path), cfg.denoise, cfg.save_coverage, !cfg.small_nebula).into_iter().find(|path| path.exists()) {
+        if let Some(found) = planned_outputs(Path::new(&cfg.output_path), cfg.denoise, cfg.green_noise, cfg.save_coverage, !cfg.small_nebula).into_iter().find(|path| path.exists()) {
             return Err(format!("{} existe déjà", found.display()));
         }
     }
@@ -627,6 +630,22 @@ fn finish_stack(cfg: &JobConfig, gpu: &Gpu, budget: usize, free: usize, total: u
     fits::write_fits(&bge_path, &image, stacked.channels, out_h, out_w, &cards)?;
     emit(Event::Log { level: "ok".into(), message: format!("écrit {}", bge_path.display()) });
     write_step_png(&base, "_4_extraction_fond", &image, stacked.channels, out_h, out_w, emit)?;
+    let scnr_path = if cfg.green_noise && stacked.channels == 3 {
+        emit(Event::Progress { phase: "Bruit vert".into(), done: 0.0, total: 1.0, detail: String::new() });
+        crate::engine::scnr::apply(&mut image, stacked.channels, out_h, out_w, cancel)?;
+        cards.extend(fits::history("green noise SCNR, masked on (R+B)/2"));
+        let scnr_path = step_path(&base, "_SCNR", &ext);
+        emit(Event::Progress { phase: "Écriture FITS".into(), done: total_rows, total: total_rows, detail: scnr_path.display().to_string() });
+        fits::write_fits(&scnr_path, &image, stacked.channels, out_h, out_w, &cards)?;
+        emit(Event::Log { level: "ok".into(), message: format!("écrit {}", scnr_path.display()) });
+        write_step_png(&base, "_5_bruit_vert", &image, stacked.channels, out_h, out_w, emit)?;
+        Some(scnr_path)
+    } else {
+        if cfg.green_noise {
+            emit(Event::Log { level: "info".into(), message: "bruit vert sauté, image mono".into() });
+        }
+        None
+    };
     let ab_path = if cfg.small_nebula {
         emit(Event::Log { level: "info".into(), message: "aberrations sautées, petite nébuleuse".into() });
         None
@@ -640,7 +659,7 @@ fn finish_stack(cfg: &JobConfig, gpu: &Gpu, budget: usize, free: usize, total: u
         emit(Event::Progress { phase: "Écriture FITS".into(), done: total_rows, total: total_rows, detail: ab_path.display().to_string() });
         fits::write_fits(&ab_path, &image, stacked.channels, out_h, out_w, &cards)?;
         emit(Event::Log { level: "ok".into(), message: format!("écrit {}", ab_path.display()) });
-        write_step_png(&base, "_5_aberrations", &image, stacked.channels, out_h, out_w, emit)?;
+        write_step_png(&base, "_6_aberrations", &image, stacked.channels, out_h, out_w, emit)?;
         Some(ab_path)
     };
     let display_suffix = if cfg.denoise {
@@ -654,12 +673,14 @@ fn finish_stack(cfg: &JobConfig, gpu: &Gpu, budget: usize, free: usize, total: u
         emit(Event::Progress { phase: "Écriture FITS".into(), done: total_rows, total: total_rows, detail: dn_path.display().to_string() });
         fits::write_fits(&dn_path, &image, stacked.channels, out_h, out_w, &cards)?;
         emit(Event::Log { level: "ok".into(), message: format!("écrit {}", dn_path.display()) });
-        write_step_png(&base, "_6_debruitage", &image, stacked.channels, out_h, out_w, emit)?;
+        write_step_png(&base, "_7_debruitage", &image, stacked.channels, out_h, out_w, emit)?;
         "_DN"
-    } else if cfg.small_nebula {
-        "_BGE"
-    } else {
+    } else if !cfg.small_nebula {
         "_AB"
+    } else if scnr_path.is_some() {
+        "_SCNR"
+    } else {
+        "_BGE"
     };
     let [png16, tiff] = depth_paths(&base, display_suffix);
     export::write_png(&png16, &image, stacked.channels, out_h, out_w, true)?;
@@ -669,6 +690,9 @@ fn finish_stack(cfg: &JobConfig, gpu: &Gpu, budget: usize, free: usize, total: u
     emit(Event::Progress { phase: "Stretch HyperMetric".into(), done: 1.0, total: 1.0, detail: format!("Log D {log_d:.2}") });
     emit(Event::Log { level: "ok".into(), message: format!("terminé en {elapsed:.1} s · {}", stack_path.display()) });
     let mut listed = vec![stretch_path.display().to_string(), bge_path.display().to_string()];
+    if let Some(path) = &scnr_path {
+        listed.push(path.display().to_string());
+    }
     if let Some(path) = &ab_path {
         listed.push(path.display().to_string());
     }
@@ -763,7 +787,7 @@ fn writes_products(cfg: &JobConfig) -> bool {
     !cfg.analyze_only && !(cfg.rows.is_some() && cfg.output_path.is_empty())
 }
 
-pub fn planned_outputs(base: &Path, denoise: bool, coverage: bool, aberrations: bool) -> Vec<PathBuf> {
+pub fn planned_outputs(base: &Path, denoise: bool, green_noise: bool, coverage: bool, aberrations: bool) -> Vec<PathBuf> {
     let ext = fits_extension(base);
     let mut paths = vec![
         step_path(base, "_postStack", &ext),
@@ -774,20 +798,26 @@ pub fn planned_outputs(base: &Path, denoise: bool, coverage: bool, aberrations: 
         step_path(base, "_BGE", &ext),
         step_path(base, "_4_extraction_fond", "png"),
     ];
+    if green_noise {
+        paths.push(step_path(base, "_SCNR", &ext));
+        paths.push(step_path(base, "_5_bruit_vert", "png"));
+    }
     if aberrations {
         paths.push(step_path(base, "_AB", &ext));
-        paths.push(step_path(base, "_5_aberrations", "png"));
+        paths.push(step_path(base, "_6_aberrations", "png"));
     }
     let shown = if denoise {
         "_DN"
     } else if aberrations {
         "_AB"
+    } else if green_noise {
+        "_SCNR"
     } else {
         "_BGE"
     };
     if denoise {
         paths.push(step_path(base, "_DN", &ext));
-        paths.push(step_path(base, "_6_debruitage", "png"));
+        paths.push(step_path(base, "_7_debruitage", "png"));
     }
     paths.extend(depth_paths(base, shown));
     if coverage {
@@ -890,7 +920,7 @@ pub fn auto_output_path(folder: &Path, name: &str, frames: usize, seconds: f64) 
     let base = folder.join(format!("{name}_{frames}frames_{:.1}h_gpu_{stamp}", seconds / 3600.0));
     let mut path = base.with_extension("fit");
     let mut k = 2;
-    while planned_outputs(&path, true, true, true).iter().any(|item| item.exists()) {
+    while planned_outputs(&path, true, true, true, true).iter().any(|item| item.exists()) {
         path = PathBuf::from(format!("{}_{k}.fit", base.display()));
         k += 1;
     }
@@ -1105,7 +1135,7 @@ mod tests {
         assert_eq!(step_path(&base, "_postStack", "fits"), PathBuf::from("stacks").join("M42_postStack.fits"));
         assert_eq!(step_path(&base, "_stretch", "fits"), PathBuf::from("stacks").join("M42_stretch.fits"));
         assert_eq!(step_path(&base, "_DN", "fits"), PathBuf::from("stacks").join("M42_DN.fits"));
-        let names: Vec<_> = planned_outputs(&base, true, true, true).iter().map(|path| path.file_name().unwrap().to_string_lossy().into_owned()).collect();
+        let names: Vec<_> = planned_outputs(&base, true, true, true, true).iter().map(|path| path.file_name().unwrap().to_string_lossy().into_owned()).collect();
         assert!(names.contains(&"M42_postStack.fits".to_string()));
         assert!(names.contains(&"M42_1_empilement.png".to_string()));
         assert!(names.contains(&"M42_stretch.fits".to_string()));
@@ -1113,25 +1143,33 @@ mod tests {
         assert!(names.contains(&"M42_3_recadrage.png".to_string()));
         assert!(names.contains(&"M42_BGE.fits".to_string()));
         assert!(names.contains(&"M42_4_extraction_fond.png".to_string()));
+        assert!(names.contains(&"M42_SCNR.fits".to_string()));
+        assert!(names.contains(&"M42_5_bruit_vert.png".to_string()));
         assert!(names.contains(&"M42_AB.fits".to_string()));
-        assert!(names.contains(&"M42_5_aberrations.png".to_string()));
+        assert!(names.contains(&"M42_6_aberrations.png".to_string()));
         assert!(names.contains(&"M42_DN.fits".to_string()));
-        assert!(names.contains(&"M42_6_debruitage.png".to_string()));
+        assert!(names.contains(&"M42_7_debruitage.png".to_string()));
         assert!(names.contains(&"M42_DN.tiff".to_string()));
         assert!(names.contains(&"M42_coverage.fits".to_string()));
-        let plain: Vec<_> = planned_outputs(&base, false, false, true).iter().map(|path| path.file_name().unwrap().to_string_lossy().into_owned()).collect();
+        let plain: Vec<_> = planned_outputs(&base, false, false, false, true).iter().map(|path| path.file_name().unwrap().to_string_lossy().into_owned()).collect();
         assert!(plain.contains(&"M42_1_empilement.png".to_string()));
         assert!(plain.contains(&"M42_2_stretch.png".to_string()));
         assert!(plain.contains(&"M42_4_extraction_fond.png".to_string()));
-        assert!(plain.contains(&"M42_5_aberrations.png".to_string()));
-        assert!(!plain.iter().any(|name| name.contains("_DN")));
-        let small: Vec<_> = planned_outputs(&base, true, false, false).iter().map(|path| path.file_name().unwrap().to_string_lossy().into_owned()).collect();
+        assert!(plain.contains(&"M42_6_aberrations.png".to_string()));
+        assert!(!plain.iter().any(|name| name.contains("_DN") || name.contains("_SCNR") || name.contains("bruit_vert")));
+        let small: Vec<_> = planned_outputs(&base, true, true, false, false).iter().map(|path| path.file_name().unwrap().to_string_lossy().into_owned()).collect();
         assert!(small.contains(&"M42_BGE.fits".to_string()));
+        assert!(small.contains(&"M42_SCNR.fits".to_string()));
+        assert!(small.contains(&"M42_5_bruit_vert.png".to_string()));
         assert!(small.contains(&"M42_DN.fits".to_string()));
         assert!(small.contains(&"M42_DN.tiff".to_string()));
         assert!(!small.iter().any(|name| name.contains("_AB") || name.contains("aberrations")));
-        let kept: Vec<_> = planned_outputs(&base, false, false, false).iter().map(|path| path.file_name().unwrap().to_string_lossy().into_owned()).collect();
+        let kept: Vec<_> = planned_outputs(&base, false, false, false, false).iter().map(|path| path.file_name().unwrap().to_string_lossy().into_owned()).collect();
         assert!(kept.contains(&"M42_BGE.tiff".to_string()));
-        assert!(!kept.iter().any(|name| name.contains("_AB") || name.contains("aberrations") || name.contains("_DN")));
+        assert!(!kept.iter().any(|name| name.contains("_AB") || name.contains("aberrations") || name.contains("_DN") || name.contains("_SCNR")));
+        let scnr_only: Vec<_> = planned_outputs(&base, false, true, false, false).iter().map(|path| path.file_name().unwrap().to_string_lossy().into_owned()).collect();
+        assert!(scnr_only.contains(&"M42_SCNR.tiff".to_string()));
+        assert!(scnr_only.contains(&"M42_5_bruit_vert.png".to_string()));
+        assert!(!scnr_only.iter().any(|name| name.contains("_AB") || name.contains("_DN")));
     }
 }

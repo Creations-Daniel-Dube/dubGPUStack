@@ -99,6 +99,7 @@ fn stack_config(args: &[String]) -> Result<JobConfig, i32> {
             "--transform" => { cfg.transform = take(args, &mut index)?.to_string(); Ok(()) }
             "--analyze-only" => { cfg.analyze_only = true; Ok(()) }
             "--denoise" => { cfg.denoise = true; Ok(()) }
+            "--green-noise" => { cfg.green_noise = true; Ok(()) }
             "--small-nebula" => { cfg.small_nebula = true; Ok(()) }
             "--strip" => { cfg.strip = take(args, &mut index)?.parse().unwrap_or(0); Ok(()) }
             "--tile" => { cfg.tile = take(args, &mut index)?.parse().unwrap_or(0); Ok(()) }
@@ -195,10 +196,11 @@ fn print_help() {
     println("  [--sigma BAS HAUT] [--weight none|noise|wfwhm|nbstars] [--feather PIXELS]");
     println("  [--no-norm] [--no-rgb-equal] [--no-output-norm] [--rows Y0 Y1] [--crop X Y W H]");
     println("  [--overwrite] [--gpu-mem-gib N] [--scale 1|1.5|2|3] [--pixfrac 0.05..1]");
-    println("  [--transform affine|similarity] [--strip N] [--tile N] [--workers N] [--analyze-only] [--denoise] [--small-nebula]");
+    println("  [--transform affine|similarity] [--strip N] [--tile N] [--workers N] [--analyze-only] [--denoise] [--green-noise] [--small-nebula]");
     println("  strip et tile à 0 choisissent la bande selon la mémoire libre");
+    println("  --green-noise retire le grain vert du fond après l'extraction de fond");
     println("  --small-nebula saute la correction d'aberrations");
-    println("  --out est le nom de base : les fichiers reçoivent _postStack, _stretch, _BGE, _AB et _DN");
+    println("  --out est le nom de base : les fichiers reçoivent _postStack, _stretch, _BGE, _SCNR, _AB et _DN");
     println("Sans argument, ou avec un chemin, l'interface s'ouvre.");
 }
 
