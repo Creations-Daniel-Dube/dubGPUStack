@@ -8,13 +8,27 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
-const PACKAGE_URL: &str = "https://github.com/Creations-Daniel-Dube/dubGPUStack/releases/download/runtime/dubGPUStack_Required.zip";
+fn package() -> (&'static str, &'static str) {
+    if cfg!(windows) {
+        (
+            "https://github.com/Creations-Daniel-Dube/dubGPUStack/releases/download/runtime/dubGPUStack_Required.zip",
+            "dubGPUStack_Required.zip.partial",
+        )
+    } else {
+        (
+            "https://github.com/Creations-Daniel-Dube/dubGPUStack/releases/download/runtime/dubGPUStack_Required_linux.zip",
+            "dubGPUStack_Required_linux.zip.partial",
+        )
+    }
+}
 
-const MARKERS: &[&str] = &[
-    "dubNoise/dub_noise_rd.wts",
-    "siril/model_v2_5_0.onnx",
-    "onnxruntime/onnxruntime.dll",
-];
+fn markers() -> &'static [&'static str] {
+    if cfg!(windows) {
+        &["dubNoise/dub_noise_rd.wts", "siril/model_v2_5_0.onnx", "onnxruntime/onnxruntime.dll"]
+    } else {
+        &["dubNoise/dub_noise_rd.wts", "siril/model_v2_5_0.onnx", "onnxruntime/lib/libonnxruntime.so"]
+    }
+}
 
 pub enum Update {
     Progress { fraction: f32, label: String },
@@ -29,13 +43,9 @@ impl Fetch {
     pub fn spawn() -> Self {
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
-            let result = if cfg!(windows) {
-                download_and_install(|fraction, label| {
-                    let _ = tx.send(Update::Progress { fraction, label: label.to_string() });
-                })
-            } else {
-                Err("Fichiers requis introuvables.".to_string())
-            };
+            let result = download_and_install(|fraction, label| {
+                let _ = tx.send(Update::Progress { fraction, label: label.to_string() });
+            });
             let _ = tx.send(Update::Finished(result));
         });
         Self { rx }
@@ -58,7 +68,7 @@ pub fn install_dir() -> PathBuf {
 }
 
 pub fn ready() -> bool {
-    MARKERS.iter().all(|marker| roots().iter().any(|root| root.join(marker).is_file()))
+    markers().iter().all(|marker| roots().iter().any(|root| root.join(marker).is_file()))
 }
 
 pub fn enable_dll_search() {
@@ -83,9 +93,6 @@ pub fn ensure_blocking() -> Result<(), String> {
     if ready() {
         return Ok(());
     }
-    if !cfg!(windows) {
-        return Err("Fichiers requis introuvables.".to_string());
-    }
     download_and_install(|fraction, label| eprintln!("{label} {:.0} %", fraction * 100.0))?;
     enable_dll_search();
     if ready() {
@@ -98,9 +105,10 @@ pub fn ensure_blocking() -> Result<(), String> {
 fn download_and_install(mut progress: impl FnMut(f32, &str)) -> Result<(), String> {
     let dir = install_dir();
     fs::create_dir_all(&dir).map_err(|err| format!("dossier des fichiers requis : {err}"))?;
-    let archive = dir.join("dubGPUStack_Required.zip.partial");
+    let (url, partial) = package();
+    let archive = dir.join(partial);
     progress(0.0, "Téléchargement des fichiers requis");
-    download(PACKAGE_URL, &archive, &mut progress)?;
+    download(url, &archive, &mut progress)?;
     progress(1.0, "Installation des fichiers requis");
     extract(&archive, &dir)?;
     let _ = fs::remove_file(&archive);
@@ -167,10 +175,37 @@ fn extract(archive: &Path, dest: &Path) -> Result<(), String> {
         if let Some(parent) = target.parent() {
             fs::create_dir_all(parent).map_err(|err| format!("{} : {err}", parent.display()))?;
         }
+        if entry.is_symlink() {
+            place_symlink(&mut entry, &target)?;
+            continue;
+        }
         let mut output = File::create(&target).map_err(|err| format!("{} : {err}", target.display()))?;
         io::copy(&mut entry, &mut output).map_err(|err| format!("{} : {err}", target.display()))?;
     }
     Ok(())
+}
+
+fn place_symlink(entry: &mut impl Read, target: &Path) -> Result<(), String> {
+    let mut link = String::new();
+    entry.read_to_string(&mut link).map_err(|err| format!("{} : {err}", target.display()))?;
+    let link = link.trim_end_matches('\0');
+    let path = Path::new(link);
+    if link.is_empty() || path.is_absolute() || path.components().any(|part| matches!(part, std::path::Component::ParentDir)) {
+        return Err(format!("{} : lien symbolique refusé", target.display()));
+    }
+    #[cfg(unix)]
+    {
+        if target.symlink_metadata().is_ok() {
+            fs::remove_file(target).map_err(|err| format!("{} : {err}", target.display()))?;
+        }
+        std::os::unix::fs::symlink(link, target).map_err(|err| format!("{} : {err}", target.display()))?;
+        return Ok(());
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = target;
+        Err("lien symbolique non pris en charge".to_string())
+    }
 }
 
 fn roots() -> Vec<PathBuf> {
@@ -234,5 +269,32 @@ mod tests {
     fn top_level_files_stay_in_place() {
         let paths = vec![PathBuf::from("cublas64_12.dll"), PathBuf::from("dubNoise/dub_noise_rd.wts")];
         assert_eq!(common_directory(&paths), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_symlink_is_restored() {
+        let dir = std::env::temp_dir().join(format!("dubgpustack-zip-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let archive = dir.join("pack.zip");
+        let mut file = File::create(&archive).unwrap();
+        let mut writer = zip::ZipWriter::new(&mut file);
+        let options = zip::write::SimpleFileOptions::default();
+        writer.add_symlink("onnxruntime/lib/libonnxruntime.so", "libonnxruntime.so.1.31.0", options).unwrap();
+        writer.start_file("onnxruntime/lib/libonnxruntime.so.1.31.0", options).unwrap();
+        writer.write_all(b"runtime").unwrap();
+        writer.start_file("dubNoise/marker.txt", options).unwrap();
+        writer.write_all(b"wts").unwrap();
+        writer.finish().unwrap();
+        drop(file);
+        let dest = dir.join("out");
+        extract(&archive, &dest).unwrap();
+        let link = dest.join("onnxruntime/lib/libonnxruntime.so");
+        assert!(link.symlink_metadata().unwrap().file_type().is_symlink());
+        assert_eq!(fs::read_link(&link).unwrap(), PathBuf::from("libonnxruntime.so.1.31.0"));
+        assert_eq!(fs::read(dest.join("onnxruntime/lib/libonnxruntime.so.1.31.0")).unwrap(), b"runtime");
+        assert_eq!(fs::read(&link).unwrap(), b"runtime");
+        let _ = fs::remove_dir_all(&dir);
     }
 }

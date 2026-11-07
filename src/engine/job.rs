@@ -54,6 +54,8 @@ pub struct JobConfig {
     pub pixfrac: f64,
     pub transform: String,
     pub denoise: bool,
+    /// Cochée, la correction d'aberrations est sautée. Une petite nébuleuse comme M57 garde son anneau.
+    pub small_nebula: bool,
     pub analyze_only: bool,
 }
 
@@ -86,6 +88,7 @@ impl Default for JobConfig {
             pixfrac: 1.0,
             transform: "affine".to_string(),
             denoise: false,
+            small_nebula: false,
             analyze_only: false,
         }
     }
@@ -173,7 +176,9 @@ pub fn run(cfg: &JobConfig, cancel: &AtomicBool, crop: Option<&CropGate>, mut em
     let started = std::time::Instant::now();
     cfg.validate()?;
     if writes_products(cfg) {
-        crate::engine::aberration::require_model()?;
+        if !cfg.small_nebula {
+            crate::engine::aberration::require_model()?;
+        }
         if cfg.denoise {
             crate::engine::denoise::require_weights()?;
         }
@@ -523,7 +528,7 @@ fn run_lights(cfg: &JobConfig, gpu: &Gpu, budget: usize, free: usize, total: usi
 
 fn finish_stack(cfg: &JobConfig, gpu: &Gpu, budget: usize, free: usize, total: usize, cancel: &AtomicBool, crop: Option<&CropGate>, emit: &mut impl FnMut(Event), samples: Vec<SampleFrame>, channels: usize, region: (i32, i32, i32, i32), reference: &Path, metas: &[sequence::FrameMeta]) -> Result<RunOutput, String> {
     if cfg.rows.is_none() && !cfg.output_path.is_empty() && !cfg.overwrite {
-        if let Some(found) = planned_outputs(Path::new(&cfg.output_path), cfg.denoise, cfg.save_coverage).into_iter().find(|path| path.exists()) {
+        if let Some(found) = planned_outputs(Path::new(&cfg.output_path), cfg.denoise, cfg.save_coverage, !cfg.small_nebula).into_iter().find(|path| path.exists()) {
             return Err(format!("{} existe déjà", found.display()));
         }
     }
@@ -591,6 +596,7 @@ fn finish_stack(cfg: &JobConfig, gpu: &Gpu, budget: usize, free: usize, total: u
     emit(Event::Progress { phase: "Écriture FITS".into(), done: total_rows, total: total_rows, detail: stack_path.display().to_string() });
     fits::write_fits(&stack_path, &data, stacked.channels, stacked.height, stacked.width, &cards)?;
     emit(Event::Log { level: "ok".into(), message: format!("écrit {}", stack_path.display()) });
+    write_step_png(&base, "_1_empilement", &data, stacked.channels, stacked.height, stacked.width, emit)?;
     if let Some(coverage) = &stacked.coverage {
         let cov: Vec<f32> = coverage.iter().map(|v| *v as f32).collect();
         let cov_path = step_path(&base, "_coverage", &ext);
@@ -604,12 +610,13 @@ fn finish_stack(cfg: &JobConfig, gpu: &Gpu, budget: usize, free: usize, total: u
     emit(Event::Progress { phase: "Écriture FITS".into(), done: total_rows, total: total_rows, detail: stretch_path.display().to_string() });
     fits::write_fits(&stretch_path, &stretched.image, stacked.channels, stacked.height, stacked.width, &cards)?;
     emit(Event::Log { level: "ok".into(), message: format!("écrit {}", stretch_path.display()) });
+    write_step_png(&base, "_2_stretch", &stretched.image, stacked.channels, stacked.height, stacked.width, emit)?;
     let log_d = stretched.log_d;
     let mut image = stretched.image;
     let mut out_w = stacked.width;
     let mut out_h = stacked.height;
     if let Some(gate) = crop {
-        offer_crop(&mut image, stacked.channels, &mut out_h, &mut out_w, &mut cards, gate, cancel, emit)?;
+        offer_crop(&mut image, stacked.channels, &mut out_h, &mut out_w, &mut cards, &base, gate, cancel, emit)?;
     }
     emit(Event::Progress { phase: "Extraction de fond".into(), done: 0.0, total: 4.0, detail: stretch_path.display().to_string() });
     crate::engine::bge::apply(&mut image, stacked.channels, out_h, out_w, cancel, |done, total| {
@@ -619,15 +626,23 @@ fn finish_stack(cfg: &JobConfig, gpu: &Gpu, budget: usize, free: usize, total: u
     emit(Event::Progress { phase: "Écriture FITS".into(), done: total_rows, total: total_rows, detail: bge_path.display().to_string() });
     fits::write_fits(&bge_path, &image, stacked.channels, out_h, out_w, &cards)?;
     emit(Event::Log { level: "ok".into(), message: format!("écrit {}", bge_path.display()) });
-    emit(Event::Progress { phase: "Aberrations".into(), done: 0.0, total: 1.0, detail: "tuile 0".into() });
-    let aberrations = crate::engine::aberration::apply(&mut image, stacked.channels, out_h, out_w, cancel, |done, total| {
-        emit(Event::Progress { phase: "Aberrations".into(), done: done as f64, total: total as f64, detail: format!("tuile {done}/{total}") });
-    })?;
-    emit(Event::Log { level: "ok".into(), message: format!("aberrations {}, {} tuiles en {:.1} s", aberrations.device, aberrations.tiles, aberrations.seconds) });
-    let ab_path = step_path(&base, "_AB", &ext);
-    emit(Event::Progress { phase: "Écriture FITS".into(), done: total_rows, total: total_rows, detail: ab_path.display().to_string() });
-    fits::write_fits(&ab_path, &image, stacked.channels, out_h, out_w, &cards)?;
-    emit(Event::Log { level: "ok".into(), message: format!("écrit {}", ab_path.display()) });
+    write_step_png(&base, "_4_extraction_fond", &image, stacked.channels, out_h, out_w, emit)?;
+    let ab_path = if cfg.small_nebula {
+        emit(Event::Log { level: "info".into(), message: "aberrations sautées, petite nébuleuse".into() });
+        None
+    } else {
+        emit(Event::Progress { phase: "Aberrations".into(), done: 0.0, total: 1.0, detail: "tuile 0".into() });
+        let aberrations = crate::engine::aberration::apply(&mut image, stacked.channels, out_h, out_w, cancel, |done, total| {
+            emit(Event::Progress { phase: "Aberrations".into(), done: done as f64, total: total as f64, detail: format!("tuile {done}/{total}") });
+        })?;
+        emit(Event::Log { level: "ok".into(), message: format!("aberrations {}, {} tuiles en {:.1} s", aberrations.device, aberrations.tiles, aberrations.seconds) });
+        let ab_path = step_path(&base, "_AB", &ext);
+        emit(Event::Progress { phase: "Écriture FITS".into(), done: total_rows, total: total_rows, detail: ab_path.display().to_string() });
+        fits::write_fits(&ab_path, &image, stacked.channels, out_h, out_w, &cards)?;
+        emit(Event::Log { level: "ok".into(), message: format!("écrit {}", ab_path.display()) });
+        write_step_png(&base, "_5_aberrations", &image, stacked.channels, out_h, out_w, emit)?;
+        Some(ab_path)
+    };
     let display_suffix = if cfg.denoise {
         let tiles = crate::engine::denoise::tile_count_hint(image.len(), stacked.channels, out_h, out_w);
         emit(Event::Progress { phase: "Débruitage".into(), done: 0.0, total: tiles as f64, detail: format!("tuile 0/{tiles}") });
@@ -639,34 +654,34 @@ fn finish_stack(cfg: &JobConfig, gpu: &Gpu, budget: usize, free: usize, total: u
         emit(Event::Progress { phase: "Écriture FITS".into(), done: total_rows, total: total_rows, detail: dn_path.display().to_string() });
         fits::write_fits(&dn_path, &image, stacked.channels, out_h, out_w, &cards)?;
         emit(Event::Log { level: "ok".into(), message: format!("écrit {}", dn_path.display()) });
+        write_step_png(&base, "_6_debruitage", &image, stacked.channels, out_h, out_w, emit)?;
         "_DN"
+    } else if cfg.small_nebula {
+        "_BGE"
     } else {
         "_AB"
     };
-    let [png8, png16, tiff] = display_paths(&base, display_suffix);
-    export::write_png(&png8, &image, stacked.channels, out_h, out_w, false)?;
+    let [png16, tiff] = depth_paths(&base, display_suffix);
     export::write_png(&png16, &image, stacked.channels, out_h, out_w, true)?;
     export::write_tiff32(&tiff, &image, stacked.channels, out_h, out_w)?;
     let shown = (out_w / 960).max(1);
     let (preview, preview_h, preview_w) = stack::bin_preview(&image, stacked.channels, out_h, out_w, shown);
     emit(Event::Progress { phase: "Stretch HyperMetric".into(), done: 1.0, total: 1.0, detail: format!("Log D {log_d:.2}") });
     emit(Event::Log { level: "ok".into(), message: format!("terminé en {elapsed:.1} s · {}", stack_path.display()) });
+    let mut listed = vec![stretch_path.display().to_string(), bge_path.display().to_string()];
+    if let Some(path) = &ab_path {
+        listed.push(path.display().to_string());
+    }
+    listed.push(png16.display().to_string());
+    listed.push(tiff.display().to_string());
     emit(Event::Log {
         level: "ok".into(),
-        message: format!(
-            "HyperMetric Log D = {log_d:.2} · {} · {} · {} · {} · {} · {}",
-            stretch_path.display(),
-            bge_path.display(),
-            ab_path.display(),
-            png8.display(),
-            png16.display(),
-            tiff.display()
-        ),
+        message: format!("HyperMetric Log D = {log_d:.2} · {}", listed.join(" · ")),
     });
     Ok(RunOutput { path: stack_path.display().to_string(), frames: samples.len(), low: stacked.rejected_low, high: stacked.rejected_high, width: out_w, height: out_h, channels: stacked.channels, elapsed, preview, preview_w, preview_h, display_ready: true })
 }
 
-fn offer_crop(image: &mut Vec<f32>, channels: usize, height: &mut usize, width: &mut usize, cards: &mut Vec<String>, gate: &CropGate, cancel: &AtomicBool, emit: &mut impl FnMut(Event)) -> Result<(), String> {
+fn offer_crop(image: &mut Vec<f32>, channels: usize, height: &mut usize, width: &mut usize, cards: &mut Vec<String>, base: &Path, gate: &CropGate, cancel: &AtomicBool, emit: &mut impl FnMut(Event)) -> Result<(), String> {
     emit(Event::Progress { phase: "Recadrage".into(), done: 0.0, total: 1.0, detail: "en attente".into() });
     let pause = crop_pause(image, channels, *height, *width);
     if gate.pause_tx.send(pause).is_err() {
@@ -691,6 +706,7 @@ fn offer_crop(image: &mut Vec<f32>, channels: usize, height: &mut usize, width: 
             let shown = crop_pause(image, channels, *height, *width);
             emit(Event::Preview { rgba: shown.rgba, width: shown.preview_w, height: shown.preview_h });
             emit(Event::Log { level: "info".into(), message: format!("recadrage {:.2}° · {}×{}", spec.rect.angle_deg, new_w, new_h) });
+            write_step_png(base, "_3_recadrage", image, channels, *height, *width, emit)?;
             Ok(())
         }
     }
@@ -729,9 +745,15 @@ pub fn step_path(base: &Path, suffix: &str, extension: &str) -> PathBuf {
     dir.join(format!("{stem}{suffix}.{extension}"))
 }
 
-fn display_paths(base: &Path, suffix: &str) -> [PathBuf; 3] {
+fn write_step_png(base: &Path, suffix: &str, image: &[f32], channels: usize, height: usize, width: usize, emit: &mut impl FnMut(Event)) -> Result<(), String> {
+    let path = step_path(base, suffix, "png");
+    export::write_png(&path, image, channels, height, width, false)?;
+    emit(Event::Log { level: "ok".into(), message: format!("écrit {}", path.display()) });
+    Ok(())
+}
+
+fn depth_paths(base: &Path, suffix: &str) -> [PathBuf; 2] {
     [
-        step_path(base, suffix, "png"),
         step_path(base, &format!("{suffix}_16"), "png"),
         step_path(base, suffix, "tiff"),
     ]
@@ -741,14 +763,33 @@ fn writes_products(cfg: &JobConfig) -> bool {
     !cfg.analyze_only && !(cfg.rows.is_some() && cfg.output_path.is_empty())
 }
 
-pub fn planned_outputs(base: &Path, denoise: bool, coverage: bool) -> Vec<PathBuf> {
+pub fn planned_outputs(base: &Path, denoise: bool, coverage: bool, aberrations: bool) -> Vec<PathBuf> {
     let ext = fits_extension(base);
-    let mut paths = vec![step_path(base, "_postStack", &ext), step_path(base, "_stretch", &ext), step_path(base, "_BGE", &ext), step_path(base, "_AB", &ext)];
-    let shown = if denoise { "_DN" } else { "_AB" };
+    let mut paths = vec![
+        step_path(base, "_postStack", &ext),
+        step_path(base, "_1_empilement", "png"),
+        step_path(base, "_stretch", &ext),
+        step_path(base, "_2_stretch", "png"),
+        step_path(base, "_3_recadrage", "png"),
+        step_path(base, "_BGE", &ext),
+        step_path(base, "_4_extraction_fond", "png"),
+    ];
+    if aberrations {
+        paths.push(step_path(base, "_AB", &ext));
+        paths.push(step_path(base, "_5_aberrations", "png"));
+    }
+    let shown = if denoise {
+        "_DN"
+    } else if aberrations {
+        "_AB"
+    } else {
+        "_BGE"
+    };
     if denoise {
         paths.push(step_path(base, "_DN", &ext));
+        paths.push(step_path(base, "_6_debruitage", "png"));
     }
-    paths.extend(display_paths(base, shown));
+    paths.extend(depth_paths(base, shown));
     if coverage {
         paths.push(step_path(base, "_coverage", &ext));
     }
@@ -849,7 +890,7 @@ pub fn auto_output_path(folder: &Path, name: &str, frames: usize, seconds: f64) 
     let base = folder.join(format!("{name}_{frames}frames_{:.1}h_gpu_{stamp}", seconds / 3600.0));
     let mut path = base.with_extension("fit");
     let mut k = 2;
-    while planned_outputs(&path, true, true).iter().any(|item| item.exists()) || display_paths(&path, "_stretch").iter().any(|item| item.exists()) {
+    while planned_outputs(&path, true, true, true).iter().any(|item| item.exists()) {
         path = PathBuf::from(format!("{}_{k}.fit", base.display()));
         k += 1;
     }
@@ -1064,16 +1105,33 @@ mod tests {
         assert_eq!(step_path(&base, "_postStack", "fits"), PathBuf::from("stacks").join("M42_postStack.fits"));
         assert_eq!(step_path(&base, "_stretch", "fits"), PathBuf::from("stacks").join("M42_stretch.fits"));
         assert_eq!(step_path(&base, "_DN", "fits"), PathBuf::from("stacks").join("M42_DN.fits"));
-        let names: Vec<_> = planned_outputs(&base, true, true).iter().map(|path| path.file_name().unwrap().to_string_lossy().into_owned()).collect();
+        let names: Vec<_> = planned_outputs(&base, true, true, true).iter().map(|path| path.file_name().unwrap().to_string_lossy().into_owned()).collect();
         assert!(names.contains(&"M42_postStack.fits".to_string()));
+        assert!(names.contains(&"M42_1_empilement.png".to_string()));
         assert!(names.contains(&"M42_stretch.fits".to_string()));
+        assert!(names.contains(&"M42_2_stretch.png".to_string()));
+        assert!(names.contains(&"M42_3_recadrage.png".to_string()));
         assert!(names.contains(&"M42_BGE.fits".to_string()));
+        assert!(names.contains(&"M42_4_extraction_fond.png".to_string()));
         assert!(names.contains(&"M42_AB.fits".to_string()));
+        assert!(names.contains(&"M42_5_aberrations.png".to_string()));
         assert!(names.contains(&"M42_DN.fits".to_string()));
+        assert!(names.contains(&"M42_6_debruitage.png".to_string()));
         assert!(names.contains(&"M42_DN.tiff".to_string()));
         assert!(names.contains(&"M42_coverage.fits".to_string()));
-        let plain: Vec<_> = planned_outputs(&base, false, false).iter().map(|path| path.file_name().unwrap().to_string_lossy().into_owned()).collect();
-        assert!(plain.contains(&"M42_AB.png".to_string()));
+        let plain: Vec<_> = planned_outputs(&base, false, false, true).iter().map(|path| path.file_name().unwrap().to_string_lossy().into_owned()).collect();
+        assert!(plain.contains(&"M42_1_empilement.png".to_string()));
+        assert!(plain.contains(&"M42_2_stretch.png".to_string()));
+        assert!(plain.contains(&"M42_4_extraction_fond.png".to_string()));
+        assert!(plain.contains(&"M42_5_aberrations.png".to_string()));
         assert!(!plain.iter().any(|name| name.contains("_DN")));
+        let small: Vec<_> = planned_outputs(&base, true, false, false).iter().map(|path| path.file_name().unwrap().to_string_lossy().into_owned()).collect();
+        assert!(small.contains(&"M42_BGE.fits".to_string()));
+        assert!(small.contains(&"M42_DN.fits".to_string()));
+        assert!(small.contains(&"M42_DN.tiff".to_string()));
+        assert!(!small.iter().any(|name| name.contains("_AB") || name.contains("aberrations")));
+        let kept: Vec<_> = planned_outputs(&base, false, false, false).iter().map(|path| path.file_name().unwrap().to_string_lossy().into_owned()).collect();
+        assert!(kept.contains(&"M42_BGE.tiff".to_string()));
+        assert!(!kept.iter().any(|name| name.contains("_AB") || name.contains("aberrations") || name.contains("_DN")));
     }
 }

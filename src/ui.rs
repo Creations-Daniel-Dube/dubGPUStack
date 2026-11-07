@@ -26,6 +26,16 @@ enum Tab { Canvas, Frames, Result, Log }
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum JobKind { None, Analyze, Test, Stack }
 
+impl JobKind {
+    fn timed_name(self) -> Option<&'static str> {
+        match self {
+            JobKind::Analyze => Some("Analyse"),
+            JobKind::Stack => Some("Empilement"),
+            JobKind::Test | JobKind::None => None,
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Metric { Fwhm, Roundness, Stars, Background, Noise }
 
@@ -112,6 +122,8 @@ pub struct App {
     crop_reply: Option<mpsc::Sender<CropDecision>>,
     crop_ui: Option<CropUi>,
     advanced_open: bool,
+    job_started: Option<std::time::Instant>,
+    job_clock: String,
     open_at_start: Option<String>,
     runtime_rx: Option<Receiver<Update>>,
     runtime_fraction: f32,
@@ -152,6 +164,8 @@ impl App {
             crop_reply: None,
             crop_ui: None,
             advanced_open: false,
+            job_started: None,
+            job_clock: String::new(),
             open_at_start: open,
             runtime_rx: None,
             runtime_fraction: 0.0,
@@ -205,6 +219,9 @@ impl App {
                 Note::Preview(rgba, width, height) => self.show_rgba(ctx, &rgba, width, height),
                 Note::Finished(result) => {
                     again = false;
+                    let kind = self.job;
+                    let started = self.job_started.take();
+                    let clock = std::mem::take(&mut self.job_clock);
                     self.busy = false;
                     self.job = JobKind::None;
                     self.cancel = None;
@@ -217,6 +234,11 @@ impl App {
                         Err(err) => {
                             self.push("error", &err);
                             self.tab = Tab::Log;
+                        }
+                    }
+                    if let Some(started) = started {
+                        if let Some(name) = kind.timed_name() {
+                            self.push("info", &timing_line(name, &clock, &local_hms(), started.elapsed()));
                         }
                     }
                     self.phase.clear();
@@ -411,7 +433,7 @@ impl App {
         if self.output_path.is_empty() {
             return None;
         }
-        job::planned_outputs(Path::new(&self.output_path), self.settings.denoise, self.settings.save_coverage)
+        job::planned_outputs(Path::new(&self.output_path), self.settings.denoise, self.settings.save_coverage, !self.settings.small_nebula)
             .into_iter()
             .find(|path| path.exists())
             .map(|path| path.display().to_string())
@@ -635,6 +657,7 @@ impl App {
             pixfrac: self.settings.pixfrac,
             transform: self.settings.transform.clone(),
             denoise: self.settings.denoise && rows.is_none() && !analyze_only,
+            small_nebula: self.settings.small_nebula,
             analyze_only,
         };
         cfg.validate()?;
@@ -692,6 +715,8 @@ impl App {
             JobKind::None => String::new(),
         };
         self.busy = true;
+        self.job_started = Some(std::time::Instant::now());
+        self.job_clock = local_hms();
         self.confirm = false;
         self.fraction = 0.0;
         let gate = if !analyze_only && !test_strip {
@@ -787,7 +812,7 @@ impl App {
                     }
                     ui.close();
                 }
-                if ui.button("Empiler").on_hover_text("Empile les images sélectionnées. Écrit le FITS _postStack, puis _stretch. Le calcul s'arrête pour recadrer et redresser, puis enchaîne _BGE, _AB et, si le débruitage est actif, _DN.").clicked() { self.start(false, false); ui.close(); }
+                if ui.button("Empiler").on_hover_text("Empile les images sélectionnées. Écrit le FITS _postStack, puis _stretch. Le calcul s'arrête pour recadrer et redresser, puis enchaîne _BGE, _AB sauf si Petite Nébuleuse est cochée, et _DN si le débruitage est actif.").clicked() { self.start(false, false); ui.close(); }
                 if ui.button("Quitter").on_hover_text("Ferme dubGPUStack.").clicked() { ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close); }
             }).response.on_hover_text("Ouvrir, recharger ou quitter.");
             ui.menu_button("Images finales", |ui| {
@@ -836,34 +861,39 @@ impl App {
                 });
             }
             group(ui, "Sortie", |ui| {
-                ui.checkbox(&mut self.settings.crop, "Recadrer par couverture").on_hover_text("Garde la zone couverte par assez d'images.");
-                if self.settings.crop {
-                    let minimum = "Nombre d'images requis pour garder un pixel dans le cadre.";
-                    ui.label("Images minimum").on_hover_text(minimum);
-                    if ui.add(DragValue::new(&mut self.settings.min_coverage).range(1..=9999).speed(1.0)).on_hover_text(minimum).changed() { self.apply_crop(); }
-                    ui.horizontal(|ui| {
-                        ui.add(DragValue::new(&mut self.crop_x).range(0..=200000).prefix("x ")).on_hover_text("Bord gauche du recadrage, en pixels.");
-                        ui.add(DragValue::new(&mut self.crop_y).range(0..=200000).prefix("y ")).on_hover_text("Bord haut du recadrage, en pixels.");
-                    });
-                    ui.horizontal(|ui| {
-                        ui.add(DragValue::new(&mut self.crop_w).range(0..=200000).prefix("l ")).on_hover_text("Largeur du recadrage, en pixels.");
-                        ui.add(DragValue::new(&mut self.crop_h).range(0..=200000).prefix("h ")).on_hover_text("Hauteur du recadrage, en pixels.");
-                    });
-                }
                 if ui.button("Choisir le fichier de sortie…").on_hover_text("Change le nom de base. Chaque enregistrement ajoute le suffixe de l'étape : _postStack, _stretch, _BGE, _AB, _DN.").clicked() {
                     self.ask_output_name();
                 }
                 let name_tip = if self.output_path.is_empty() {
-                    "Sans nom choisi, un nom automatique est créé à l'empilement. Les fichiers reçoivent _postStack, _stretch, _BGE, _AB et, si le débruitage est actif, _DN."
+                    "Sans nom choisi, un nom automatique est créé à l'empilement. Les fichiers reçoivent _postStack, _stretch, _BGE, _AB et, si le débruitage est actif, _DN. Petite Nébuleuse retire _AB."
                 } else {
-                    "Nom de base, sans suffixe. L'empilement écrit ce nom avec _postStack, _stretch, _BGE, _AB et, si le débruitage est actif, _DN."
+                    "Nom de base, sans suffixe. L'empilement écrit ce nom avec _postStack, _stretch, _BGE, _AB et, si le débruitage est actif, _DN. Petite Nébuleuse retire _AB."
                 };
                 ui.label(if self.output_path.is_empty() { "Nom automatique".to_string() } else { short_path(&self.output_path) }).on_hover_text(name_tip);
-                ui.checkbox(&mut self.settings.save_coverage, "Carte de couverture").on_hover_text("Écrit aussi la carte du nombre d'images par pixel, avec le suffixe _coverage.");
-                ui.checkbox(&mut self.settings.denoise, "Débruitage dubNoise").on_hover_text("Après le FITS _AB, retire le bruit puis écrit le FITS _DN. Les FITS _postStack, _stretch, _BGE et _AB restent inchangés. Réglages figés : force 90 %, tuile 512, recouvrement 96.");
+            });
+            group(ui, "Optionnels", |ui| {
+                ui.checkbox(&mut self.settings.denoise, "Débruitage dubNoise").on_hover_text("Retire le bruit de la dernière image et écrit le FITS _DN. Il part des aberrations, ou de l'extraction de fond si Petite Nébuleuse est cochée. Réglages figés : force 90 %, tuile 512, recouvrement 96.");
+                ui.checkbox(&mut self.settings.small_nebula, "Petite Nébuleuse").on_hover_text("Saute la correction d'aberrations. Une petite nébuleuse comme M57 garde son anneau. Le débruitage, s'il est coché, part de l'extraction de fond.");
             });
             advanced_toggle(ui, &mut self.advanced_open);
             if self.advanced_open {
+                group(ui, "Cadrage Image", |ui| {
+                    ui.checkbox(&mut self.settings.crop, "Recadrer par couverture").on_hover_text("Garde la zone couverte par assez d'images.");
+                    if self.settings.crop {
+                        let minimum = "Nombre d'images requis pour garder un pixel dans le cadre.";
+                        ui.label("Images minimum").on_hover_text(minimum);
+                        if ui.add(DragValue::new(&mut self.settings.min_coverage).range(1..=9999).speed(1.0)).on_hover_text(minimum).changed() { self.apply_crop(); }
+                        ui.horizontal(|ui| {
+                            ui.add(DragValue::new(&mut self.crop_x).range(0..=200000).prefix("x ")).on_hover_text("Bord gauche du recadrage, en pixels.");
+                            ui.add(DragValue::new(&mut self.crop_y).range(0..=200000).prefix("y ")).on_hover_text("Bord haut du recadrage, en pixels.");
+                        });
+                        ui.horizontal(|ui| {
+                            ui.add(DragValue::new(&mut self.crop_w).range(0..=200000).prefix("l ")).on_hover_text("Largeur du recadrage, en pixels.");
+                            ui.add(DragValue::new(&mut self.crop_h).range(0..=200000).prefix("h ")).on_hover_text("Hauteur du recadrage, en pixels.");
+                        });
+                    }
+                    ui.checkbox(&mut self.settings.save_coverage, "Carte de couverture").on_hover_text("Écrit aussi la carte du nombre d'images par pixel, avec le suffixe _coverage.");
+                });
                 group(ui, "Empilement", |ui| {
                     combo_str(ui, "rejet", &mut self.settings.rejection, &[("winsorized", "Winsorisé"), ("sigma", "Sigma"), ("none", "Aucun")], "Winsorisé adoucit les écarts, sigma les coupe, aucun garde tout.");
                     let low = "Seuil de rejet des pixels trop sombres.";
@@ -911,7 +941,7 @@ impl App {
         if ui.add_enabled(!self.busy, egui::Button::new(RichText::new(test).size(16.0)).min_size(wide)).on_hover_text("Empile une bande de 192 lignes au plus couvert, sans écrire de fichier.").clicked() {
             self.start(false, true);
         }
-        if ui.add_enabled(!self.busy, egui::Button::new(RichText::new(stack).size(16.0)).min_size(wide)).on_hover_text("Empile les images sélectionnées. Écrit le FITS _postStack, puis _stretch. Le calcul s'arrête pour recadrer et redresser, puis enchaîne _BGE, _AB et, si le débruitage est actif, _DN.").clicked() {
+        if ui.add_enabled(!self.busy, egui::Button::new(RichText::new(stack).size(16.0)).min_size(wide)).on_hover_text("Empile les images sélectionnées. Écrit le FITS _postStack, puis _stretch. Le calcul s'arrête pour recadrer et redresser, puis enchaîne _BGE, _AB sauf si Petite Nébuleuse est cochée, et _DN si le débruitage est actif.").clicked() {
             self.start(false, false);
         }
         if self.busy {
@@ -1532,7 +1562,7 @@ fn install_font(ctx: &egui::Context) {
 
 fn advanced_toggle(ui: &mut egui::Ui, open: &mut bool) {
     ui.add_space(6.0);
-    let help = "Affiche ou cache Empilement et Carte Vidéo / GPU.";
+    let help = "Affiche ou cache Cadrage Image, Empilement et Carte Vidéo / GPU.";
     let clicked = ui.horizontal(|ui| {
         let title = ui.add(egui::Label::new(RichText::new("Fonctions avancées").strong()).sense(egui::Sense::click())).on_hover_text(help);
         let icon = if *open { "▲" } else { "▼" };
@@ -1670,4 +1700,78 @@ fn free_bytes(path: &Path) -> Option<u64> {
     }
     #[cfg(not(windows))]
     { let _ = path; None }
+}
+
+fn timing_line(function: &str, start: &str, end: &str, elapsed: std::time::Duration) -> String {
+    let total = elapsed.as_secs();
+    let hours = total / 3600;
+    let minutes = (total % 3600) / 60;
+    let seconds = total % 60;
+    format!("Temps total {function} {start} {end}  Total;   {hours:02}:{minutes:02}:{seconds:02}")
+}
+
+fn local_hms() -> String {
+    #[cfg(windows)]
+    {
+        #[repr(C)]
+        struct SystemTime {
+            year: u16,
+            month: u16,
+            day_of_week: u16,
+            day: u16,
+            hour: u16,
+            minute: u16,
+            second: u16,
+            milliseconds: u16,
+        }
+        unsafe extern "system" {
+            fn GetLocalTime(out: *mut SystemTime);
+        }
+        let mut time = SystemTime { year: 0, month: 0, day_of_week: 0, day: 0, hour: 0, minute: 0, second: 0, milliseconds: 0 };
+        unsafe { GetLocalTime(&mut time) };
+        format!("{:02}:{:02}:{:02}", time.hour, time.minute, time.second)
+    }
+    #[cfg(not(windows))]
+    {
+        #[repr(C)]
+        struct Tm {
+            sec: i32,
+            min: i32,
+            hour: i32,
+            mday: i32,
+            mon: i32,
+            year: i32,
+            wday: i32,
+            yday: i32,
+            isdst: i32,
+            gmtoff: i64,
+            zone: *const i8,
+        }
+        unsafe extern "C" {
+            fn time(tloc: *mut i64) -> i64;
+            fn localtime_r(timer: *const i64, result: *mut Tm) -> *mut Tm;
+        }
+        unsafe {
+            let mut now = 0i64;
+            time(&mut now);
+            let mut broken = std::mem::zeroed::<Tm>();
+            if localtime_r(&now, &mut broken).is_null() {
+                return "00:00:00".to_string();
+            }
+            format!("{:02}:{:02}:{:02}", broken.hour, broken.min, broken.sec)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn journal_timing_line_uses_clocks_and_elapsed() {
+        let line = timing_line("Analyse", "19:01:02", "19:04:07", std::time::Duration::from_secs(185));
+        assert_eq!(line, "Temps total Analyse 19:01:02 19:04:07  Total;   00:03:05");
+        let long = timing_line("Empilement", "08:00:00", "09:01:01", std::time::Duration::from_secs(3661));
+        assert_eq!(long, "Temps total Empilement 08:00:00 09:01:01  Total;   01:01:01");
+    }
 }

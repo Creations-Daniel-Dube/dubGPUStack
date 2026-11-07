@@ -2,9 +2,12 @@
 //! Correction d'aberrations par le modèle ONNX d'Aberration Remover 1.1.4
 //! (Riccardo Alberghi, GPL-3.0-or-later).
 //!
-//! Tuiles 512, recouvrement 64, fenêtre de Hann. Force 100 %, réduction des
-//! anneaux sombres et protection du fond. Le graphe est exécuté par ONNX Runtime :
-//! CUDA s'il se charge, sinon le processeur.
+//! Tuiles 512, recouvrement 64, fenêtre de Hann, force 100 %. Le graphe est
+//! exécuté par ONNX Runtime : CUDA s'il se charge, sinon le processeur.
+//!
+//! « Dark ringing reduction » et « Protect background » restent désactivées,
+//! comme les cases du script 1.1.4. Les activer recolle le halo d'origine
+//! autour du cœur corrigé par le modèle.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -18,6 +21,8 @@ const OVERLAP: usize = 64;
 const MODEL_NAME: &str = "model_v2_5_0.onnx";
 const INPUT_NAME: &str = "gen_input_image";
 const STRENGTH: f32 = 1.0;
+const DARK_RINGING: bool = false;
+const PROTECT_BACKGROUND: bool = false;
 const MAD_FLOOR: f64 = 1e-8;
 const HANN_FLOOR: f32 = 1e-3;
 
@@ -54,6 +59,8 @@ pub fn apply(image: &mut [f32], channels: usize, height: usize, width: usize, ca
     let cols = patch_starts(pad_w, PATCH, OVERLAP);
     let total = rows.len() * cols.len() * channels;
     let mut accum = vec![0.0f32; channels * pad_h * pad_w];
+    // La fenêtre est la même pour chaque couche. Le poids ne doit être compté qu'une fois,
+    // sinon une image couleur est divisée par le nombre de couches et les nébuleuses disparaissent.
     let mut weight = vec![0.0f32; pad_h * pad_w];
     let mut done = 0usize;
     progress(0, total);
@@ -83,7 +90,7 @@ pub fn apply(image: &mut [f32], channels: usize, height: usize, width: usize, ca
                         *value = 0.0;
                     }
                 }
-                blend_patch(&mut accum[plane..plane + pad_h * pad_w], &mut weight, &predicted, &window, pad_w, y0, x0);
+                blend_patch(&mut accum[plane..plane + pad_h * pad_w], &mut weight, &predicted, &window, pad_w, y0, x0, channel == 0);
                 done += 1;
                 progress(done, total);
             }
@@ -98,8 +105,7 @@ pub fn apply(image: &mut [f32], channels: usize, height: usize, width: usize, ca
     }
     let mut result = crop(&accum, channels, pad_h, pad_w, height, width);
     let original = image[..channels * pixels].to_vec();
-    suppress_dark_rings(&mut result, &original, channels, height, width);
-    protect_background(&mut result, &original, channels, height, width);
+    apply_optional_filters(&mut result, &original, channels, height, width, DARK_RINGING, PROTECT_BACKGROUND);
     for (value, source) in result.iter_mut().zip(&original) {
         let mixed = (1.0 - STRENGTH) * *source + STRENGTH * *value;
         *value = if mixed.is_finite() { mixed.clamp(0.0, 1.0) } else { 0.0 };
@@ -118,8 +124,17 @@ fn open_session(env: &ort::environment::Environment, path: &Path) -> Result<(Ses
 }
 
 fn ort_env() -> Result<ort::environment::Environment, String> {
+    // ONNX Runtime n'accepte qu'un environnement par processus, même après sa destruction.
+    // On le conserve pour que la correction suivante réutilise le même.
+    static KEPT: std::sync::Mutex<Option<ort::environment::Environment>> = std::sync::Mutex::new(None);
+    let mut slot = KEPT.lock().map_err(|_| "ONNX Runtime : verrou indisponible".to_string())?;
+    if let Some(env) = slot.as_ref() {
+        return Ok(env.clone());
+    }
     let dll = require_runtime()?;
-    ort::init_from(&dll).map_err(|err| format!("ONNX Runtime : {err}"))?.build().map_err(|err| format!("ONNX Runtime : {err}"))
+    let env = ort::init_from(&dll).map_err(|err| format!("ONNX Runtime : {err}"))?.build().map_err(|err| format!("ONNX Runtime : {err}"))?;
+    *slot = Some(env.clone());
+    Ok(env)
 }
 
 fn runtime_library_names() -> &'static [&'static str] {
@@ -217,6 +232,15 @@ fn match_statistics(output: &mut [f32], input: &[f32]) {
     }
 }
 
+fn apply_optional_filters(image: &mut [f32], original: &[f32], channels: usize, height: usize, width: usize, dark_ringing: bool, protect_background: bool) {
+    if dark_ringing {
+        suppress_dark_rings(image, original, channels, height, width);
+    }
+    if protect_background {
+        protect_background_pixels(image, original, channels, height, width);
+    }
+}
+
 fn suppress_dark_rings(image: &mut [f32], original: &[f32], channels: usize, height: usize, width: usize) {
     for channel in 0..channels {
         let offset = channel * height * width;
@@ -240,7 +264,7 @@ fn dark_threshold(plane: &[f32], height: usize, width: usize) -> Vec<f32> {
     zoom_bilinear(&filtered, sh, sw, height, width)
 }
 
-fn protect_background(image: &mut [f32], original: &[f32], channels: usize, height: usize, width: usize) {
+fn protect_background_pixels(image: &mut [f32], original: &[f32], channels: usize, height: usize, width: usize) {
     let pixels = height * width;
     for channel in 0..channels {
         let offset = channel * pixels;
@@ -378,14 +402,16 @@ fn extract(image: &[f32], width: usize, plane: usize, y0: usize, x0: usize) -> V
     patch
 }
 
-fn blend_patch(accum: &mut [f32], weight: &mut [f32], patch: &[f32], window: &[f32], width: usize, y0: usize, x0: usize) {
+fn blend_patch(accum: &mut [f32], weight: &mut [f32], patch: &[f32], window: &[f32], width: usize, y0: usize, x0: usize, record_weight: bool) {
     for y in 0..PATCH {
         let dst = (y0 + y) * width + x0;
         let src = y * PATCH;
         for x in 0..PATCH {
             let w = window[src + x];
             accum[dst + x] += patch[src + x] * w;
-            weight[dst + x] += w;
+            if record_weight {
+                weight[dst + x] += w;
+            }
         }
     }
 }
@@ -517,6 +543,69 @@ mod tests {
         let median = median_of(&output);
         assert!((median - 0.2).abs() < 1e-5, "{median}");
         assert!(output.iter().all(|value| value.is_finite()));
+    }
+
+    #[test]
+    fn a_second_environment_reuses_the_first() {
+        if require_runtime().is_err() {
+            return;
+        }
+        let first = ort_env().expect("premier environnement");
+        drop(first);
+        ort_env().expect("deuxième environnement");
+    }
+
+    fn ring_image() -> Vec<f32> {
+        let mut image = vec![0.15f32; 512 * 512];
+        for y in 0..512 {
+            for x in 0..512 {
+                let dx = x as f32 - 256.0;
+                let dy = y as f32 - 256.0;
+                let radius = (dx * dx + dy * dy).sqrt();
+                if (40.0..80.0).contains(&radius) {
+                    image[y * 512 + x] = 0.45;
+                }
+                if radius < 3.0 {
+                    image[y * 512 + x] = 0.95;
+                }
+            }
+        }
+        image
+    }
+
+    fn ring_median(image: &[f32], plane: usize) -> f64 {
+        let mut ring = Vec::new();
+        for y in 0..512 {
+            for x in 0..512 {
+                let dx = x as f32 - 256.0;
+                let dy = y as f32 - 256.0;
+                let radius = (dx * dx + dy * dy).sqrt();
+                if (50.0..70.0).contains(&radius) {
+                    ring.push(image[plane + y * 512 + x]);
+                }
+            }
+        }
+        median_of(&ring)
+    }
+
+    #[test]
+    fn an_extended_ring_survives_the_correction() {
+        if require_model().is_err() {
+            return;
+        }
+        let mut mono = ring_image();
+        let cancel = AtomicBool::new(false);
+        apply(&mut mono, 1, 512, 512, &cancel, |_, _| {}).expect("mono");
+        let mono_ring = ring_median(&mono, 0);
+        let mut color = vec![0.0f32; 3 * 512 * 512];
+        let source = ring_image();
+        for channel in 0..3 {
+            color[channel * 512 * 512..(channel + 1) * 512 * 512].copy_from_slice(&source);
+        }
+        apply(&mut color, 3, 512, 512, &cancel, |_, _| {}).expect("couleur");
+        let color_ring = ring_median(&color, 0);
+        assert!(mono_ring > 0.30, "anneau mono effacé, médiane {mono_ring}");
+        assert!(color_ring > 0.30, "anneau couleur effacé, médiane {color_ring}");
     }
 
     #[test]
