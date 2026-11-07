@@ -229,7 +229,7 @@ impl App {
                     self.crop_rx = None;
                     self.crop_reply = None;
                     match result {
-                        Ok(output) => self.finish_ok(ctx, output),
+                        Ok(output) => self.finish_ok(ctx, output, kind),
                         Err(err) if err == "cancelled" => self.push("warn", "annulé"),
                         Err(err) => {
                             self.push("error", &err);
@@ -304,11 +304,13 @@ impl App {
         self.phase = if applying { "Recadrage · application".into() } else { "Extraction de fond".into() };
     }
 
-    fn finish_ok(&mut self, ctx: &egui::Context, output: RunOutput) {
+    fn finish_ok(&mut self, ctx: &egui::Context, output: RunOutput, kind: JobKind) {
         self.apply_analysis();
         self.coverage_tex = None;
         self.refresh_coverage();
-        if !output.path.is_empty() {
+        if kind == JobKind::Analyze {
+            self.tab = Tab::Frames;
+        } else if !output.path.is_empty() {
             self.result_path = output.path.clone();
             self.tab = Tab::Result;
         } else if !output.preview.is_empty() {
@@ -1198,7 +1200,7 @@ impl eframe::App for App {
         egui::Panel::left("reglages").resizable(true).exact_size(340.0).show(ui, |ui| self.sidebar(ui));
         egui::Panel::bottom("etat").show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.selectable_value(&mut self.tab, Tab::Canvas, "Canevas").on_hover_text("Montre la couverture ou l'aperçu.");
+                ui.selectable_value(&mut self.tab, Tab::Canvas, "Couverture Images").on_hover_text("Montre la couverture ou l'aperçu.");
                 ui.selectable_value(&mut self.tab, Tab::Frames, "Images").on_hover_text("Courbe de qualité et choix des images à empiler.");
                 ui.selectable_value(&mut self.tab, Tab::Result, "Résultat").on_hover_text("Aperçu de l'image écrite.");
                 ui.selectable_value(&mut self.tab, Tab::Log, "Journal").on_hover_text("Messages du calcul en cours ou terminé.");
