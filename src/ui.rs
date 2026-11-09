@@ -39,6 +39,8 @@ impl JobKind {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Metric { Fwhm, Roundness, Stars, Background, Noise }
 
+const METRICS: [Metric; 5] = [Metric::Fwhm, Metric::Roundness, Metric::Stars, Metric::Background, Metric::Noise];
+
 struct Row {
     key: String,
     filenum: i64,
@@ -104,7 +106,7 @@ pub struct App {
     phase: String,
     fraction: f32,
     tab: Tab,
-    metric: Metric,
+    metrics_on: [bool; 5],
     linked: bool,
     confirm: bool,
     result_path: String,
@@ -147,7 +149,7 @@ impl App {
             phase: String::new(),
             fraction: 0.0,
             tab: Tab::Canvas,
-            metric: Metric::Fwhm,
+            metrics_on: [true; 5],
             linked: true,
             confirm: false,
             result_path: String::new(),
@@ -1028,73 +1030,101 @@ impl App {
         let mut include = false;
         let mut exclude = false;
         ui.horizontal(|ui| {
-            ComboBox::from_id_salt("metric").selected_text(metric_name(self.metric)).show_ui(ui, |ui| {
-                for metric in [Metric::Fwhm, Metric::Roundness, Metric::Stars, Metric::Background, Metric::Noise] {
-                    ui.selectable_value(&mut self.metric, metric, format!("{}  —  {}", metric_name(metric), metric_gloss(metric)));
-                }
-            }).response.on_hover_text("Grandeur tracée pour comparer les images.");
+            for (index, metric) in METRICS.iter().enumerate() {
+                let color = metric_color(*metric);
+                let (swatch, _) = ui.allocate_exact_size(egui::vec2(28.0, 10.0), egui::Sense::hover());
+                paint_metric_line(ui.painter(), &[swatch.left_center(), swatch.right_center()], *metric);
+                ui.checkbox(&mut self.metrics_on[index], RichText::new(metric_name(*metric)).color(color))
+                    .on_hover_text(format!("{} — {}", metric_gloss(*metric), metric_legend(*metric)));
+            }
+        });
+        ui.horizontal(|ui| {
             if ui.button("Inclure").on_hover_text("Garde l'image sélectionnée dans l'empilement.").clicked() { include = true; }
             if ui.button("Exclure").on_hover_text("Retire l'image sélectionnée de l'empilement.").clicked() { exclude = true; }
             if ui.button("Exclure les pires").on_hover_text("Retire environ 10 % des images les moins nettes.").clicked() { worst = true; }
             if ui.button("Réinitialiser").on_hover_text("Coche toutes les images et efface la référence.").clicked() { reset = true; }
             if ui.button("Référence").on_hover_text("Utilise l'image sélectionnée comme référence d'alignement.").clicked() { set_ref = true; }
         });
-        let metric = self.metric;
-        ui.horizontal(|ui| {
-            let (swatch, _) = ui.allocate_exact_size(egui::vec2(22.0, 10.0), egui::Sense::hover());
-            ui.painter().line_segment([swatch.left_center(), swatch.right_center()], Stroke::new(2.0, Color32::from_rgb(0xff, 0x93, 0x20)));
-            ui.label(RichText::new(metric_legend(metric)).small());
-        });
         let selected = self.selected;
         let reference = self.loaded.as_ref().map(|loaded| loaded.reference.clone()).unwrap_or_default();
-        let values: Vec<f64> = self.loaded.as_ref().map(|loaded| loaded.rows.iter().map(|row| metric_of(row, metric)).collect()).unwrap_or_default();
+        struct Curve { metric: Metric, values: Vec<f64>, lo: f64, hi: f64 }
+        let any_on = self.metrics_on.iter().any(|on| *on);
+        let curves: Vec<Curve> = METRICS.iter().enumerate().filter(|(index, _)| self.metrics_on[*index]).filter_map(|(_, metric)| {
+            let values: Vec<f64> = self.loaded.as_ref().map(|loaded| loaded.rows.iter().map(|row| metric_of(row, *metric)).collect()).unwrap_or_default();
+            let mut lo = f64::INFINITY;
+            let mut hi = f64::NEG_INFINITY;
+            let mut finite = 0usize;
+            for value in &values {
+                if value.is_finite() {
+                    finite += 1;
+                    lo = lo.min(*value);
+                    hi = hi.max(*value);
+                }
+            }
+            (finite >= 2).then_some(Curve { metric: *metric, values, lo, hi })
+        }).collect();
+        let avail = ui.available_height();
+        let list_share = (avail / 3.0).clamp(120.0, 220.0);
+        let plot_h = (avail - list_share).max(200.0) * 0.8;
         let plot = ui.available_width();
-        let plot_h = (ui.available_height() - 150.0).clamp(220.0, 280.0);
         let (rect, response) = ui.allocate_exact_size(egui::vec2(plot, plot_h), egui::Sense::hover());
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 4.0, Color32::from_rgb(0x0e, 0x03, 0x03));
-        let inner = egui::Rect::from_min_max(egui::pos2(rect.left() + 72.0, rect.top() + 10.0), egui::pos2(rect.right() - 10.0, rect.bottom() - 22.0));
+        let inner = egui::Rect::from_min_max(egui::pos2(rect.left() + 120.0, rect.top() + 10.0), egui::pos2(rect.right() - 10.0, rect.bottom() - 22.0));
         let label_color = Color32::from_rgb(0xc8, 0xb4, 0x8a);
         let font = egui::FontId::proportional(12.0);
-        let finite: Vec<f64> = values.iter().copied().filter(|v| v.is_finite()).collect();
-        if finite.len() >= 2 {
-            let lo = finite.iter().copied().fold(f64::INFINITY, f64::min);
-            let hi = finite.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-            let span = (hi - lo).max(1e-9);
-            let mid_y = inner.center().y;
-            painter.hline(inner.x_range(), mid_y, Stroke::new(1.0, Color32::from_rgb(0x3d, 0x12, 0x10)));
-            painter.text(egui::pos2(inner.left() - 6.0, inner.top()), egui::Align2::RIGHT_TOP, metric_value(metric, hi), font.clone(), label_color);
-            painter.text(egui::pos2(inner.left() - 6.0, inner.bottom()), egui::Align2::RIGHT_BOTTOM, metric_value(metric, lo), font.clone(), label_color);
-            painter.text(egui::pos2(inner.left(), rect.bottom() - 4.0), egui::Align2::LEFT_BOTTOM, "1", font.clone(), label_color);
-            painter.text(egui::pos2(inner.right(), rect.bottom() - 4.0), egui::Align2::RIGHT_BOTTOM, values.len().to_string(), font, label_color);
-            let step = inner.width() / (values.len().saturating_sub(1).max(1) as f32);
-            let mut points = Vec::new();
-            for (index, value) in values.iter().enumerate() {
-                if !value.is_finite() { continue; }
-                let x = inner.left() + index as f32 * step;
-                let y = inner.bottom() - ((*value - lo) / span) as f32 * inner.height();
-                points.push(egui::pos2(x, y));
+        if !any_on {
+            painter.text(rect.center(), egui::Align2::CENTER_CENTER, "Cochez au moins une grandeur.", egui::FontId::proportional(14.0), label_color);
+        } else if curves.is_empty() {
+            painter.text(rect.center(), egui::Align2::CENTER_CENTER, "Analysez les images pour tracer cette courbe.", egui::FontId::proportional(14.0), label_color);
+        } else {
+            let count = curves[0].values.len();
+            painter.hline(inner.x_range(), inner.center().y, Stroke::new(1.0, Color32::from_rgb(0x3d, 0x12, 0x10)));
+            let n = curves.len() as f32;
+            let line_h = 14.0_f32.min((inner.height() * 0.5 / n).max(10.0));
+            for (index, curve) in curves.iter().enumerate() {
+                let color = metric_color(curve.metric);
+                let y_hi = inner.top() + index as f32 * line_h;
+                let y_lo = inner.bottom() - (n - 1.0 - index as f32) * line_h;
+                painter.text(egui::pos2(inner.left() - 6.0, y_hi), egui::Align2::RIGHT_TOP, format!("{}  {}", metric_name(curve.metric), metric_value(curve.metric, curve.hi)), font.clone(), color);
+                painter.text(egui::pos2(inner.left() - 6.0, y_lo), egui::Align2::RIGHT_BOTTOM, format!("{}  {}", metric_name(curve.metric), metric_value(curve.metric, curve.lo)), font.clone(), color);
             }
-            if points.len() >= 2 {
-                painter.line(points, Stroke::new(1.5, Color32::from_rgb(0xff, 0x93, 0x20)));
+            painter.text(egui::pos2(inner.left(), rect.bottom() - 4.0), egui::Align2::LEFT_BOTTOM, "1", font.clone(), label_color);
+            painter.text(egui::pos2(inner.right(), rect.bottom() - 4.0), egui::Align2::RIGHT_BOTTOM, count.to_string(), font.clone(), label_color);
+            let step = inner.width() / (count.saturating_sub(1).max(1) as f32);
+            for curve in curves.iter().rev() {
+                let span = (curve.hi - curve.lo).max(1e-9);
+                let mut points = Vec::new();
+                for (index, value) in curve.values.iter().enumerate() {
+                    if !value.is_finite() { continue; }
+                    let x = inner.left() + index as f32 * step;
+                    let y = inner.bottom() - ((*value - curve.lo) / span) as f32 * inner.height();
+                    points.push(egui::pos2(x, y));
+                }
+                paint_metric_line(&painter, &points, curve.metric);
             }
             if let Some(pos) = response.hover_pos() {
-                if inner.contains(pos) {
+                if inner.contains(pos) && count > 0 {
                     let index = ((pos.x - inner.left()) / step).round() as isize;
-                    let index = index.clamp(0, values.len() as isize - 1) as usize;
-                    if values[index].is_finite() {
-                        let x = inner.left() + index as f32 * step;
-                        painter.vline(x, inner.y_range(), Stroke::new(1.0, Color32::from_rgb(0xff, 0xe1, 0x4d)));
-                        response.on_hover_text(format!("image {} · {}", index + 1, metric_value(metric, values[index])));
+                    let index = index.clamp(0, count as isize - 1) as usize;
+                    let x = inner.left() + index as f32 * step;
+                    painter.vline(x, inner.y_range(), Stroke::new(1.0, Color32::from_rgb(0xff, 0xe1, 0x4d)));
+                    let mut lines = vec![format!("image {}", index + 1)];
+                    for curve in &curves {
+                        if let Some(value) = curve.values.get(index).copied().filter(|value| value.is_finite()) {
+                            lines.push(format!("{}  {}", metric_name(curve.metric), metric_value(curve.metric, value)));
+                        }
+                    }
+                    if lines.len() > 1 {
+                        response.clone().on_hover_text(lines.join("\n"));
                     }
                 }
             }
-        } else {
-            painter.text(rect.center(), egui::Align2::CENTER_CENTER, "Analysez les images pour tracer cette courbe.", egui::FontId::proportional(14.0), label_color);
         }
         let mut selected_now = selected;
         let Some(loaded) = self.loaded.as_mut() else { return };
-        egui::ScrollArea::vertical().max_height(ui.available_height()).show(ui, |ui| {
+        let list_h = ui.available_height();
+        egui::ScrollArea::vertical().max_height(list_h).auto_shrink([false, false]).show(ui, |ui| {
             for (index, row) in loaded.rows.iter_mut().enumerate() {
                 ui.horizontal(|ui| {
                     if ui.checkbox(&mut row.included, "").on_hover_text("Inclut ou exclut cette image de l'empilement.").changed() { changed = true; }
@@ -1675,6 +1705,28 @@ fn combo<T: PartialEq + Copy + 'static>(ui: &mut egui::Ui, salt: &str, value: &m
             ui.selectable_value(value, *item, *label);
         }
     }).response.on_hover_text(help);
+}
+
+fn metric_color(metric: Metric) -> Color32 {
+    match metric {
+        Metric::Fwhm => Color32::from_rgb(0xff, 0x33, 0x3a),
+        Metric::Roundness => Color32::from_rgb(0xff, 0xe1, 0x4d),
+        Metric::Stars => Color32::from_rgb(0x5e, 0xc8, 0xe6),
+        Metric::Background => Color32::from_rgb(0x8f, 0xd1, 0x8a),
+        Metric::Noise => Color32::from_rgb(0xe0, 0x70, 0xd0),
+    }
+}
+
+fn paint_metric_line(painter: &egui::Painter, points: &[egui::Pos2], metric: Metric) {
+    if points.len() < 2 { return; }
+    let stroke = Stroke::new(1.5, metric_color(metric));
+    match metric {
+        Metric::Fwhm => { painter.line(points.to_vec(), stroke); }
+        Metric::Roundness => painter.extend(egui::Shape::dashed_line(points, stroke, 8.0, 5.0)),
+        Metric::Stars => painter.extend(egui::Shape::dashed_line(points, stroke, 2.0, 4.0)),
+        Metric::Background => painter.extend(egui::Shape::dashed_line_with_offset(points, stroke, &[12.0, 2.0], &[4.0, 4.0], 0.0)),
+        Metric::Noise => painter.extend(egui::Shape::dashed_line(points, stroke, 16.0, 6.0)),
+    }
 }
 
 fn metric_name(metric: Metric) -> &'static str {
