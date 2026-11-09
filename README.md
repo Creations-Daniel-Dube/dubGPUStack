@@ -1,4 +1,4 @@
-# dubGPUStack
+# dubGPUStack 2026
 
 **Version 0.4.1010**
 
