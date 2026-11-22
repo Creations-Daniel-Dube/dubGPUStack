@@ -4,7 +4,7 @@ members = [".", "kernels"]
 
 [package]
 name = "dubGPUStack"
-version = "1.9.2351"
+version = "1.9.2400"
 edition = "2024"
 description = "Empilement GPU d'images astronomiques"
 publish = false
